@@ -1,0 +1,101 @@
+# ============================
+# ExamShield .gitignore
+# ============================
+
+# Android Build
+android/.gradle/
+android/build/
+android/app/build/
+android/app/release/
+android/app/debug/
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+android/local.properties
+android/*.iml
+android/**/*.iml
+
+# Android Studio
+.idea/
+android/.idea/
+*.iml
+.navigation/
+
+# Keystore
+*.jks
+*.keystore
+
+# APK/AAB
+*.apk
+*.aab
+*.dex
+
+# Python Backend
+backend/__pycache__/
+backend/**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Python Virtual Environment
+backend/venv/
+backend/env/
+venv/
+env/
+
+# Python Distribution
+backend/build/
+backend/dist/
+backend/*.egg-info/
+
+# Python Testing
+backend/.coverage
+backend/.pytest_cache/
+
+# Environment Files (SECURITY!)
+.env
+.env.local
+.env.*.local
+backend/.env
+dashboard/.env
+
+# Node.js Dashboard
+dashboard/node_modules/
+dashboard/dist/
+dashboard/build/
+dashboard/.next/
+dashboard/npm-debug.log*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS Files
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+
+# IDE
+.vscode/
+.vs/
+*.swp
+*.swo
+
+# Personal
+notes.md
+todo.md
+scratch.md
+
+# Backup
+*.bak
+*.backup
+*.old
+
+# Temporary
+*.tmp
+*.temp
