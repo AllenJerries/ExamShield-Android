@@ -68,17 +68,6 @@ ExamShield/
 ├── README.md
 └── LICENSE
 
-## 🎓 Team
-
-**Department of Computer Science & Engineering**
-
-- Alagumalai P (71052302010)
-- Allen Jerries A L (71052302011)
-- Harini S (71052302039)
-- Manasha V (71052302057)
-
-**Guide:** Ms. M. Pushpalatha M.E., (AP/CSE)
-
 ## 📊 Development Phases
 
 ### Phase 1 (Complete) ✅
