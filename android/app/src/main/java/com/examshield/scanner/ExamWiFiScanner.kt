@@ -21,7 +21,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 class ExamWiFiScanner(private val context: Context) {
 
@@ -64,7 +63,7 @@ class ExamWiFiScanner(private val context: Context) {
             return
         }
 
-        if (wifiManager?.isWifiEnabled != true) {
+        if (!isWifiEnabled()) {
             Log.e(TAG, "WiFi is disabled on device")
             _scanStatus.value = "WiFi OFF"
             isActive.set(false)
@@ -73,7 +72,7 @@ class ExamWiFiScanner(private val context: Context) {
         }
 
         registerReceiver()
-        startContinuousScanning()
+        startScanLoop()
     }
 
     fun stopScanning() {
@@ -113,14 +112,8 @@ class ExamWiFiScanner(private val context: Context) {
         wifiScanReceiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
                 if (intent.action == WifiManager.SCAN_RESULTS_AVAILABLE_ACTION) {
-                    val updated = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        intent.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, false)
-                    } else {
-                        true
-                    }
-                    Log.d(TAG, "Scan broadcast received (updated=$updated)")
-                    handleScanResults()
-                    _scanStatus.value = if (updated) "Fresh scan" else "Cached results"
+                    Log.d(TAG, "Scan broadcast received")
+                    processScanResults()
                 }
             }
         }
@@ -130,23 +123,26 @@ class ExamWiFiScanner(private val context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 context.registerReceiver(wifiScanReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
             } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
                 context.registerReceiver(wifiScanReceiver, filter)
             }
             Log.d(TAG, "WiFi scan receiver registered")
         }
     }
 
-    private fun startContinuousScanning() {
+    private fun startScanLoop() {
         scanJob = scope.launch {
-            Log.d(TAG, "Starting continuous scan loop")
+            Log.d(TAG, "Starting scan loop")
             while (this@ExamWiFiScanner.isActive.get()) {
                 try {
                     triggerScan()
-                    delay(30_000L)
+                    processScanResults() // Process cached results instantly
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    Log.e(TAG, "Failed: Scan loop", e)
+                    Log.e(TAG, "Scan loop error", e)
                 }
+                delay(15_000L) // Respect Android WiFi throttling but stay responsive
             }
         }
     }
@@ -168,70 +164,65 @@ class ExamWiFiScanner(private val context: Context) {
                 _scanStatus.value = "Scan triggered"
             } else {
                 _scanStatus.value = "Throttled - using cached"
-                handleScanResults()
             }
         }
     }
 
+    fun cleanupStaleDevices() {
+        val now = System.currentTimeMillis()
+        val stale = deviceMap.filter { now - it.value.lastSeen > 45000 }.keys
+        if (stale.isNotEmpty()) {
+            stale.forEach { deviceMap.remove(it) }
+            emitDevices()
+            Log.d(TAG, "Removed ${stale.size} stale WiFi devices")
+        }
+    }
+
     @SuppressLint("MissingPermission")
-    private fun handleScanResults() {
-        safeExecute("Handle scan results") {
+    private fun processScanResults() {
+        safeExecute("Process scan results") {
             val results = wifiManager?.scanResults ?: return@safeExecute
-            Log.d(TAG, "Processing ${results.size} WiFi scan results")
-
-            var hotspotCount = 0
-            for (result in results) {
-                processWiFiResult(result)?.let {
-                    if (it.isHotspot) hotspotCount++
-                }
+            results.forEach { result ->
+                processWiFiResult(result)
             }
-
             _scanCount.value++
             emitDevices()
-            Log.d(TAG, "Batch: ${results.size} results -> ${deviceMap.size} total ($hotspotCount hotspots)")
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun processWiFiResult(result: ScanResult): ExamWiFiDevice? {
-        return try {
+    private fun processWiFiResult(result: ScanResult) {
+        try {
             val ssid = result.SSID?.trim()
             val displaySsid = ssid?.ifEmpty { "Hidden Network" } ?: "Hidden Network"
-            val bssid = result.BSSID?.uppercase() ?: return null
-            if (bssid.isEmpty()) return null
+            val bssid = result.BSSID?.uppercase() ?: return
+            if (bssid.isEmpty()) return
 
             val rssi = result.level
-            if (rssi == 0) return null
+            if (rssi == 0) return
 
             val frequency = result.frequency
             val capabilities = result.capabilities ?: ""
             val isHotspot = detectMobileHotspot(displaySsid, bssid, frequency, capabilities)
 
-            val deviceType = if (isHotspot) ExamWiFiDeviceType.MOBILE_HOTSPOT else ExamWiFiDeviceType.WIFI_NETWORK
-
-            val device = ExamWiFiDevice(
+            val now = System.currentTimeMillis()
+            val existing = deviceMap[bssid]
+            deviceMap[bssid] = existing?.copy(
+                rssi = rssi,
+                lastSeen = now
+            ) ?: ExamWiFiDevice(
                 bssid = bssid,
                 ssid = displaySsid,
                 rssi = rssi,
                 frequency = frequency,
                 capabilities = capabilities,
                 isHotspot = isHotspot,
-                deviceType = deviceType,
-                firstSeen = System.currentTimeMillis(),
-                lastSeen = System.currentTimeMillis()
+                deviceType = if (isHotspot) ExamWiFiDeviceType.MOBILE_HOTSPOT else ExamWiFiDeviceType.WIFI_NETWORK,
+                firstSeen = now,
+                lastSeen = now
             )
-
-            val existing = deviceMap[bssid]
-            deviceMap[bssid] = existing?.copy(
-                rssi = rssi,
-                lastSeen = System.currentTimeMillis()
-            ) ?: device
-
-            Log.d(TAG, "${if (isHotspot) "HOTSPOT" else "WiFi"}: $displaySsid | RSSI: $rssi | Freq: $frequency")
-            device
         } catch (e: Exception) {
             Log.e(TAG, "Process result error: ${e.message}")
-            null
         }
     }
 
@@ -253,26 +244,15 @@ class ExamWiFiScanner(private val context: Context) {
             "personal hotspot", "portable", "tethering"
         )
 
-        if (hotspotKeywords.any { ssidLower.contains(it) }) {
-            Log.d(TAG, "Hotspot by name: $ssid")
-            return true
-        }
+        if (hotspotKeywords.any { ssidLower.contains(it) }) return true
 
-        if (isMobileMac(bssid)) {
-            Log.d(TAG, "Hotspot by MAC: $bssid")
-            return true
-        }
+        if (isMobileMac(bssid)) return true
 
         val is2_4GHz = frequency in 2412..2484
         val isWPA2 = capabilities.contains("WPA2")
         val hasNumberPattern = ssid.matches(Regex(".*[0-9]{4,}.*"))
 
-        if (is2_4GHz && isWPA2 && hasNumberPattern) {
-            Log.d(TAG, "Hotspot by pattern: $ssid ($frequency MHz)")
-            return true
-        }
-
-        return false
+        return is2_4GHz && isWPA2 && hasNumberPattern
     }
 
     private fun isMobileMac(mac: String): Boolean {

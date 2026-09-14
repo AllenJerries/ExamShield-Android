@@ -65,9 +65,6 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val _direction = MutableStateFlow(Direction.SEARCHING)
     val direction: StateFlow<Direction> = _direction.asStateFlow()
 
-    private val _directionConfidence = MutableStateFlow(0f)
-    val directionConfidence: StateFlow<Float> = _directionConfidence.asStateFlow()
-
     private val _huntSource = MutableStateFlow(DeviceSource.BLUETOOTH)
     val huntSource: StateFlow<DeviceSource> = _huntSource.asStateFlow()
 
@@ -80,7 +77,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val distanceSmoother = DistanceCalculator.DistanceSmoother()
     private val rssiSmoother = DistanceCalculator.RSSISmoother(bufferSize = 5)
 
-    private val directionDetector = DirectionDetector(application)
+    private val directionDetector = DirectionDetector()
 
     private var targetMac: String = ""
     private var isWifiTarget = false
@@ -127,11 +124,9 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         _proximityLevel.value = ProximityLevel.SEARCHING
         _accuracy.value = 0.0
         _direction.value = Direction.SEARCHING
-        _directionConfidence.value = 0f
 
         distanceSmoother.reset()
         rssiSmoother.reset()
-        directionDetector.start()
 
         if (isWifiTarget) {
             startWiFiHunt()
@@ -167,11 +162,9 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         _proximityLevel.value = ProximityLevel.SEARCHING
         _accuracy.value = 0.0
         _direction.value = Direction.SEARCHING
-        _directionConfidence.value = 0f
 
         distanceSmoother.reset()
         rssiSmoother.reset()
-        directionDetector.start()
 
         if (isWifiTarget) {
             startWiFiHunt()
@@ -273,7 +266,6 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
             _accuracy.value = DistanceCalculator.getAccuracyEstimate(smoothedRssi)
             _isFound.value = smoothed < 0.5
             _direction.value = directionDetector.directionToDevice
-            _directionConfidence.value = directionDetector.confidence
 
             Log.d(TAG, "RSSI: $smoothedRssi | Distance: ${String.format("%.2f", smoothed)}m")
         }

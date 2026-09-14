@@ -4,21 +4,18 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.util.Log
 import com.examshield.data.models.DeviceSource
-import com.examshield.data.models.DeviceType
 import com.examshield.data.models.RiskLevel
 import com.examshield.data.models.UnifiedDevice
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 class UnifiedScanner(private val context: Context) {
 
     companion object {
         private const val TAG = "UnifiedScanner"
-        private const val BLE_CLEANUP_INTERVAL_MS = 8_000L
-        private const val COMBINE_INTERVAL_MS = 1_000L
-        private const val BLE_STALE_TIMEOUT_MS = 20_000L
+        private const val CLEANUP_INTERVAL_MS = 5_000L
+        private const val STATS_INTERVAL_MS = 2_000L
     }
 
     private val _devices = MutableStateFlow<List<UnifiedDevice>>(emptyList())
@@ -39,16 +36,15 @@ class UnifiedScanner(private val context: Context) {
     private val _wifiActive = MutableStateFlow(false)
     val wifiActive: StateFlow<Boolean> = _wifiActive.asStateFlow()
 
-    private val bleDeviceMap = ConcurrentHashMap<String, UnifiedDevice>()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val isScanningActive = AtomicBoolean(false)
 
     val bluetoothScanner = BluetoothScanner(context)
     val wifiScanner = ExamWiFiScanner(context)
 
+    private var combineJob: Job? = null
     private var cleanupJob: Job? = null
     private var statsJob: Job? = null
-    private var combineJob: Job? = null
 
     @SuppressLint("MissingPermission")
     fun startScanning() {
@@ -58,16 +54,16 @@ class UnifiedScanner(private val context: Context) {
         _isScanning.value = true
         _scanStatus.value = ScanStatus.Starting
 
-        bluetoothScanner.startAggressiveScan()
+        bluetoothScanner.startScanning()
         wifiScanner.startScanning()
 
         _bleActive.value = true
         _wifiActive.value = true
         _scanStatus.value = ScanStatus.Active
 
-        startCleanupJob()
-        startStatsUpdate()
         startCombineLoop()
+        startCleanup()
+        startStatsUpdate()
     }
 
     fun stopScanning() {
@@ -76,15 +72,15 @@ class UnifiedScanner(private val context: Context) {
         _isScanning.value = false
         _scanStatus.value = ScanStatus.Idle
 
-        bluetoothScanner.stopAggressiveScan()
+        bluetoothScanner.stopScanning()
         wifiScanner.stopScanning()
 
         _bleActive.value = false
         _wifiActive.value = false
 
+        combineJob?.cancel()
         cleanupJob?.cancel()
         statsJob?.cancel()
-        combineJob?.cancel()
     }
 
     fun manualRefresh() {
@@ -102,147 +98,74 @@ class UnifiedScanner(private val context: Context) {
     fun isBluetoothEnabled(): Boolean = bluetoothScanner.isBluetoothEnabled()
     fun isWifiEnabled(): Boolean = wifiScanner.isWifiEnabled()
 
-    fun getDeviceCount(): Int {
-        return bleDeviceMap.size + wifiScanner.getDeviceCount()
-    }
+    fun getDeviceCount(): Int = _devices.value.size
 
     fun getDevice(mac: String): UnifiedDevice? {
-        val upper = mac.uppercase()
-        return bleDeviceMap[upper]
-            ?: wifiScanner.wifiDevices.value.find { it.bssid == upper }
-                ?.let { wifiScanner.toUnifiedDevice(it) }
+        return _devices.value.find { it.macAddress.equals(mac, true) }
     }
 
     fun clearDevices() {
-        bleDeviceMap.clear()
+        bluetoothScanner.clearDevices()
         wifiScanner.clearDevices()
         _devices.value = emptyList()
     }
 
-    private fun convertToUnifiedDevice(scanResult: com.examshield.data.models.ScanResult): UnifiedDevice? {
-        return try {
-            val mac = scanResult.macAddress
-            val rssi = scanResult.rssi
-            if (rssi == 0 || mac.isEmpty()) return null
-
-            val name = scanResult.deviceName.ifEmpty { "" }
-            val scanRecordBytes = scanResult.scanRecord
-            val macAddress = mac.uppercase()
-
-            val classification = DeviceClassifier.classifyDeviceStrict(
-                deviceName = name,
-                macAddress = macAddress,
-                rssi = rssi,
-                scanRecord = scanRecordBytes,
-                isFromWifi = false
-            )
-
-            if (!classification.shouldShow) return null
-
-            UnifiedDevice(
-                macAddress = macAddress,
-                name = name,
-                rssi = rssi,
-                source = DeviceSource.BLUETOOTH,
-                deviceType = classification.deviceType,
-                riskLevel = classification.riskLevel,
-                manufacturer = scanResult.manufacturer,
-                scanRecord = scanRecordBytes,
-                description = classification.description
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Convert BLE error", e)
-            null
-        }
-    }
-
-    private fun updateBleDeviceMap() {
-        val bleResults = bluetoothScanner.getDiscoveredDevices()
-        for ((mac, scanResult) in bleResults) {
-            val upperMac = mac.uppercase()
-            val existing = bleDeviceMap[upperMac]
-            if (existing != null) {
-                bleDeviceMap[upperMac] = existing.copy(
-                    rssi = scanResult.rssi,
-                    lastSeen = System.currentTimeMillis()
-                )
-            } else {
-                val device = convertToUnifiedDevice(scanResult)
-                if (device != null) {
-                    bleDeviceMap[upperMac] = device
-                }
-            }
-        }
-    }
-
     private fun startCombineLoop() {
+        combineJob?.cancel()
         combineJob = scope.launch {
-            while (isScanningActive.get()) {
-                try {
-                    updateBleDeviceMap()
-                    combineDevices()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Combine error: ${e.message}")
-                }
-                delay(COMBINE_INTERVAL_MS)
+            combine(
+                bluetoothScanner.devices,
+                wifiScanner.wifiDevices
+            ) { bleDevices, wifiDevices ->
+                combineLists(bleDevices, wifiDevices)
+            }.collect { combined ->
+                _devices.value = combined
             }
         }
     }
 
-    private fun combineDevices() {
-        val allDevices = mutableListOf<UnifiedDevice>()
-
-        allDevices.addAll(bleDeviceMap.values)
-
-        val wifiUnified = wifiScanner.wifiDevices.value.map { wifiScanner.toUnifiedDevice(it) }
-        allDevices.addAll(wifiUnified)
-
-        val sorted = allDevices.sortedWith(
-            compareBy<UnifiedDevice> {
-                when (it.riskLevel) {
-                    RiskLevel.CRITICAL -> 0
-                    RiskLevel.HIGH -> 1
-                    RiskLevel.MEDIUM -> 2
-                    RiskLevel.LOW -> 3
-                }
-            }.thenBy { it.proximityScore }
-        )
-
-        _devices.value = sorted
+    private fun combineLists(
+        bleDevices: List<UnifiedDevice>,
+        wifiDevices: List<ExamWiFiDevice>
+    ): List<UnifiedDevice> {
+        val wifiUnified = wifiDevices.map { wifiScanner.toUnifiedDevice(it) }
+        return (bleDevices + wifiUnified)
+            .sortedWith(
+                compareBy<UnifiedDevice> {
+                    when (it.riskLevel) {
+                        RiskLevel.CRITICAL -> 0
+                        RiskLevel.HIGH -> 1
+                        RiskLevel.MEDIUM -> 2
+                        RiskLevel.LOW -> 3
+                    }
+                }.thenBy { it.proximityScore }
+            )
+            .distinctBy { it.macAddress.uppercase() }
     }
 
-    private fun startCleanupJob() {
+    private fun startCleanup() {
+        cleanupJob?.cancel()
         cleanupJob = scope.launch {
             while (isScanningActive.get()) {
-                delay(BLE_CLEANUP_INTERVAL_MS)
-                cleanupBleDevices()
+                delay(CLEANUP_INTERVAL_MS)
+                bluetoothScanner.cleanupStaleDevices()
+                wifiScanner.cleanupStaleDevices()
             }
-        }
-    }
-
-    private fun cleanupBleDevices() {
-        val now = System.currentTimeMillis()
-        val stale = bleDeviceMap.filter {
-            now - it.value.lastSeen > BLE_STALE_TIMEOUT_MS
-        }
-        stale.keys.forEach { bleDeviceMap.remove(it) }
-        if (stale.isNotEmpty()) {
-            Log.d(TAG, "Removed ${stale.size} stale BLE devices")
         }
     }
 
     private fun startStatsUpdate() {
+        statsJob?.cancel()
         statsJob = scope.launch {
             while (isScanningActive.get()) {
-                delay(2000)
-                val bleCount = bleDeviceMap.size
-                val wifiDevices = wifiScanner.wifiDevices.value
+                delay(STATS_INTERVAL_MS)
+                val current = _devices.value
                 _scanStats.value = ScanStats(
-                    totalDevices = bleCount + wifiDevices.size,
-                    bluetoothCount = bleCount,
-                    wifiCount = wifiDevices.count { it.deviceType == ExamWiFiDeviceType.WIFI_NETWORK },
-                    hotspotCount = wifiDevices.count { it.deviceType == ExamWiFiDeviceType.MOBILE_HOTSPOT },
-                    unauthorizedCount = bleCount + wifiDevices.size
+                    totalDevices = current.size,
+                    bluetoothCount = current.count { it.source == DeviceSource.BLUETOOTH },
+                    wifiCount = current.count { it.source == DeviceSource.WIFI_NETWORK },
+                    hotspotCount = current.count { it.source == DeviceSource.WIFI_HOTSPOT },
+                    unauthorizedCount = current.size
                 )
             }
         }

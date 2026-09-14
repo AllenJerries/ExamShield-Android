@@ -4,7 +4,6 @@ import android.util.Log
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -20,8 +19,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -58,7 +55,6 @@ fun ProximityHunterScreen(
     val isFound by viewModel.isFound.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val direction by viewModel.direction.collectAsState()
-    val directionConfidence by viewModel.directionConfidence.collectAsState()
     val huntSource by viewModel.huntSource.collectAsState()
 
     val deviceTypeEnum = parseDeviceType(targetDeviceType)
@@ -270,8 +266,7 @@ fun ProximityHunterScreen(
 
             StableDirectionGuide(
                 direction = direction,
-                confidence = directionConfidence,
-                color = proxColor
+                mainColor = proxColor
             )
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -321,116 +316,80 @@ fun ProximityHunterScreen(
 @Composable
 private fun StableDirectionGuide(
     direction: Direction,
-    confidence: Float,
-    color: Color
+    mainColor: Color
 ) {
-    val arrowRotation by animateFloatAsState(
-        targetValue = when (direction) {
-            Direction.FRONT -> 0f
-            Direction.RIGHT -> 90f
-            Direction.BACK -> 180f
-            Direction.LEFT -> 270f
-            else -> 0f
-        },
-        animationSpec = tween(600),
-        label = "arrowRotation"
-    )
-
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = color.copy(alpha = 0.08f)
+            containerColor = Color(0xFF1E2637)
         ),
-        shape = RoundedCornerShape(12.dp)
+        shape = RoundedCornerShape(16.dp)
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier = Modifier.padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
-                text = "DIRECTION GUIDE",
-                fontWeight = FontWeight.Bold,
-                fontSize = 13.sp,
-                letterSpacing = 1.sp,
-                color = color
+                text = "PROXIMITY TREND",
+                color = mainColor,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold
             )
-
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(12.dp))
 
             Box(
                 modifier = Modifier
-                    .size(100.dp)
-                    .background(
-                        color = color.copy(alpha = 0.15f),
-                        shape = CircleShape
-                    ),
+                    .size(80.dp)
+                    .background(mainColor.copy(alpha = 0.2f), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 when (direction) {
-                    Direction.STAY -> {
-                        Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = "Move",
-                            tint = Color(0xFFFF9800),
-                            modifier = Modifier.size(50.dp)
-                        )
-                    }
-                    Direction.SEARCHING, Direction.UNKNOWN -> {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(50.dp),
-                            color = color,
-                            strokeWidth = 4.dp
-                        )
-                    }
-                    else -> {
-                        Icon(
-                            imageVector = Icons.Default.ArrowUpward,
-                            contentDescription = "Direction",
-                            tint = color,
-                            modifier = Modifier
-                                .size(60.dp)
-                                .rotate(arrowRotation)
-                        )
-                    }
+                    Direction.GETTING_CLOSER -> Icon(
+                        Icons.Default.KeyboardDoubleArrowUp,
+                        null,
+                        tint = Color.Green,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Direction.MOVING_AWAY -> Icon(
+                        Icons.Default.KeyboardDoubleArrowDown,
+                        null,
+                        tint = Color.Red,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Direction.STAY -> Icon(
+                        Icons.Default.AccessibilityNew,
+                        null,
+                        tint = Color.Yellow,
+                        modifier = Modifier.size(40.dp)
+                    )
+                    Direction.SEARCHING -> CircularProgressIndicator(
+                        color = mainColor,
+                        modifier = Modifier.size(40.dp)
+                    )
                 }
             }
 
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(12.dp))
 
-            Text(
-                text = getDirectionText(direction),
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                color = color
-            )
-
-            Text(
-                text = getDirectionHint(direction),
-                fontSize = 12.sp,
-                color = Color.Gray,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(horizontal = 16.dp)
-            )
-
-            if (confidence > 0) {
-                Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(
-                    progress = { (confidence / 100f).coerceIn(0f, 1f) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(6.dp),
-                    color = color,
-                    trackColor = color.copy(alpha = 0.15f),
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "Confidence: ${confidence.toInt()}%",
-                    fontSize = 10.sp,
-                    color = Color.Gray
-                )
+            val (dirText, dirHint) = when (direction) {
+                Direction.GETTING_CLOSER -> "GETTING WARMER" to "Keep walking this way!"
+                Direction.MOVING_AWAY -> "GETTING COLDER" to "Turn around, signal dropping."
+                Direction.STAY -> "STABLE" to "Walk to detect changes."
+                Direction.SEARCHING -> "ANALYZING" to "Gathering signal data..."
             }
+
+            Text(
+                text = dirText,
+                color = mainColor,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = dirHint,
+                color = Color.Gray,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
         }
     }
 }
@@ -575,26 +534,18 @@ private fun getSignalStrengthText(rssi: Int): String {
 
 private fun getDirectionText(direction: Direction): String {
     return when (direction) {
-        Direction.FRONT -> "GO FRONT"
-        Direction.BACK -> "GO BACK"
-        Direction.LEFT -> "GO LEFT"
-        Direction.RIGHT -> "GO RIGHT"
-        Direction.STAY -> "WALK TO DETECT"
+        Direction.GETTING_CLOSER -> "GETTING WARMER"
+        Direction.MOVING_AWAY -> "GETTING COLDER"
+        Direction.STAY -> "STABLE"
         Direction.SEARCHING -> "SEARCHING..."
-        Direction.UNKNOWN -> "MOVE AROUND"
-        Direction.FOUND -> "DEVICE FOUND"
     }
 }
 
 private fun getDirectionHint(direction: Direction): String {
     return when (direction) {
-        Direction.FRONT -> "Device is in front of you"
-        Direction.BACK -> "Device is behind you - turn around"
-        Direction.LEFT -> "Device is to your left"
-        Direction.RIGHT -> "Device is to your right"
-        Direction.STAY -> "Walk 2-3 steps in any direction"
+        Direction.GETTING_CLOSER -> "Keep walking this way"
+        Direction.MOVING_AWAY -> "Turn around, signal dropping"
+        Direction.STAY -> "Walk 2-3 steps to detect changes"
         Direction.SEARCHING -> "Keep walking to determine direction"
-        Direction.UNKNOWN -> "Move around the room"
-        Direction.FOUND -> "You have reached the device"
     }
 }
