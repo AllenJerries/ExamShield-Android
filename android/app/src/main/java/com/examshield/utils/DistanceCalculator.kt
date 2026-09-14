@@ -6,9 +6,9 @@ import kotlin.math.pow
 
 object DistanceCalculator {
 
-    private const val BLE_TX_POWER = -50
-    private const val WIFI_TX_POWER = -35
-    private const val INDOOR_PATH_LOSS = 2.0
+    private const val BLE_TX_POWER = -55
+    private const val WIFI_TX_POWER = -40
+    private const val INDOOR_PATH_LOSS = 2.5
 
     fun calculateDistance(
         rssi: Int,

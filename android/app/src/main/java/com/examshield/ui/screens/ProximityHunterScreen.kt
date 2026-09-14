@@ -55,6 +55,7 @@ fun ProximityHunterScreen(
     val isFound by viewModel.isFound.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val direction by viewModel.direction.collectAsState()
+    val directionConfidence by viewModel.directionConfidence.collectAsState()
     val huntSource by viewModel.huntSource.collectAsState()
 
     val deviceTypeEnum = parseDeviceType(targetDeviceType)
@@ -266,6 +267,7 @@ fun ProximityHunterScreen(
 
             StableDirectionGuide(
                 direction = direction,
+                confidence = directionConfidence,
                 mainColor = proxColor
             )
 
@@ -316,6 +318,7 @@ fun ProximityHunterScreen(
 @Composable
 private fun StableDirectionGuide(
     direction: Direction,
+    confidence: Int,
     mainColor: Color
 ) {
     Card(
@@ -357,7 +360,7 @@ private fun StableDirectionGuide(
                         modifier = Modifier.size(48.dp)
                     )
                     Direction.STAY -> Icon(
-                        Icons.Default.AccessibilityNew,
+                        Icons.Default.PanTool,
                         null,
                         tint = Color.Yellow,
                         modifier = Modifier.size(40.dp)
@@ -390,6 +393,16 @@ private fun StableDirectionGuide(
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center
             )
+
+            if (confidence > 0) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "Confidence $confidence%",
+                    color = mainColor.copy(alpha = 0.85f),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
         }
     }
 }

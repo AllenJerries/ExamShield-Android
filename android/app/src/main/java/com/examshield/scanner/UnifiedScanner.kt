@@ -40,7 +40,7 @@ class UnifiedScanner(private val context: Context) {
     private val isScanningActive = AtomicBoolean(false)
 
     val bluetoothScanner = BluetoothScanner(context)
-    val wifiScanner = ExamWiFiScanner(context)
+    val wifiScanner = WifiScanner(context)
 
     private var combineJob: Job? = null
     private var cleanupJob: Job? = null
@@ -104,6 +104,14 @@ class UnifiedScanner(private val context: Context) {
         return _devices.value.find { it.macAddress.equals(mac, true) }
     }
 
+    fun getLiveRssi(mac: String, isWifi: Boolean): Int? {
+        return if (isWifi) {
+            wifiScanner.getDeviceRssi(mac)
+        } else {
+            bluetoothScanner.getDeviceRssi(mac)
+        }
+    }
+
     fun clearDevices() {
         bluetoothScanner.clearDevices()
         wifiScanner.clearDevices()
@@ -115,7 +123,7 @@ class UnifiedScanner(private val context: Context) {
         combineJob = scope.launch {
             combine(
                 bluetoothScanner.devices,
-                wifiScanner.wifiDevices
+                wifiScanner.devices
             ) { bleDevices, wifiDevices ->
                 combineLists(bleDevices, wifiDevices)
             }.collect { combined ->
@@ -126,10 +134,9 @@ class UnifiedScanner(private val context: Context) {
 
     private fun combineLists(
         bleDevices: List<UnifiedDevice>,
-        wifiDevices: List<ExamWiFiDevice>
+        wifiDevices: List<UnifiedDevice>
     ): List<UnifiedDevice> {
-        val wifiUnified = wifiDevices.map { wifiScanner.toUnifiedDevice(it) }
-        return (bleDevices + wifiUnified)
+        return (bleDevices + wifiDevices)
             .sortedWith(
                 compareBy<UnifiedDevice> {
                     when (it.riskLevel) {

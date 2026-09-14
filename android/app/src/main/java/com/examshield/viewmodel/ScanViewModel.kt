@@ -18,6 +18,7 @@ import com.examshield.scanner.DeviceClassifier
 import com.examshield.scanner.NetworkMonitor
 import com.examshield.scanner.NetworkStatus
 import com.examshield.scanner.ScanStatus
+import com.examshield.scanner.ScannerProvider
 import com.examshield.scanner.UnifiedScanner
 import com.examshield.scanner.WifiScanner
 import com.examshield.utils.AlarmManager
@@ -51,7 +52,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     private val db = AppDatabase.getDatabase(application)
     private val deviceRepository = DeviceRepository(db)
     private val examRepository = ExamRepository(db)
-    private val unifiedScanner = UnifiedScanner(application)
+    private val unifiedScanner = ScannerProvider.get(application)
     private val bluetoothScanner = BluetoothScanner(application)
     private val wifiScanner = WifiScanner(application)
     private val cellularScanner = CellularScanner(application)
@@ -132,7 +133,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     val wifiDeviceCount: StateFlow<Int> = run {
         val flow = MutableStateFlow(0)
         viewModelScope.launch {
-            unifiedScanner.wifiScanner.wifiDevices.collect { flow.value = it.size }
+            unifiedScanner.wifiScanner.devices.collect { flow.value = it.size }
         }
         flow.asStateFlow()
     }
@@ -468,6 +469,8 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     fun setHuntTarget(device: UnifiedDevice) {
         _currentHuntTarget.value = device
     }
+
+    fun getScanner(): UnifiedScanner = unifiedScanner
 
     fun manualRefreshWiFi() {
         unifiedScanner.manualRefresh()

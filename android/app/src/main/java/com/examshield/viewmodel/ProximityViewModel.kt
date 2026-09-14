@@ -1,33 +1,28 @@
 package com.examshield.viewmodel
 
-import android.Manifest
-import android.annotation.SuppressLint
 import android.app.Application
-import android.bluetooth.BluetoothManager
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
-import android.content.Context
-import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
-import android.os.Build
 import android.util.Log
-import androidx.core.app.ActivityCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.examshield.data.models.DeviceSource
 import com.examshield.data.models.UnifiedDevice
 import com.examshield.scanner.Direction
 import com.examshield.scanner.DirectionDetector
+import com.examshield.scanner.ScannerProvider
+import com.examshield.scanner.UnifiedScanner
 import com.examshield.utils.AlarmManager
 import com.examshield.utils.DistanceCalculator
 import com.examshield.utils.ProximityLevel
-import com.examshield.utils.SettingsRepository
 import com.examshield.utils.VibrationHelper
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -36,6 +31,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     companion object {
         private const val TAG = "ProximityViewModel"
         private const val STALE_TIMEOUT_MS = 3000L
+        private const val POLL_INTERVAL_MS = 300L
     }
 
     private val _rssi = MutableStateFlow(-100)
@@ -65,6 +61,9 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val _direction = MutableStateFlow(Direction.SEARCHING)
     val direction: StateFlow<Direction> = _direction.asStateFlow()
 
+    private val _directionConfidence = MutableStateFlow(0)
+    val directionConfidence: StateFlow<Int> = _directionConfidence.asStateFlow()
+
     private val _huntSource = MutableStateFlow(DeviceSource.BLUETOOTH)
     val huntSource: StateFlow<DeviceSource> = _huntSource.asStateFlow()
 
@@ -78,28 +77,21 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val rssiSmoother = DistanceCalculator.RSSISmoother(bufferSize = 5)
 
     private val directionDetector = DirectionDetector()
+    private val vibrationHelper = VibrationHelper(getApplication())
+
+    private var unifiedScanner: UnifiedScanner? = ScannerProvider.get(getApplication())
 
     private var targetMac: String = ""
     private var isWifiTarget = false
-    private var scanCallback: ScanCallback? = null
     private var huntJob: Job? = null
-    private var wifiHuntJob: Job? = null
-    private var timeoutJob: Job? = null
     private var beepJob: Job? = null
-
-    private val bluetoothManager = getApplication<Application>()
-        .getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-    private val bluetoothAdapter = bluetoothManager?.adapter
-    private val bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
-
-    private val wifiManager = getApplication<Application>()
-        .applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-
-    private val vibrationHelper = VibrationHelper(getApplication())
-    private val settingsRepo = SettingsRepository(application)
 
     private val isHunting = AtomicBoolean(false)
     private val lastRssiUpdate = AtomicLong(0)
+
+    fun setScanner(scanner: UnifiedScanner) {
+        unifiedScanner = scanner
+    }
 
     fun startHunting(macAddress: String, source: DeviceSource) {
         Log.d(TAG, "START HUNT: $macAddress | $source")
@@ -111,30 +103,23 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
         AlarmManager.stopAll()
 
+        val scanner = unifiedScanner
+        if (scanner == null) {
+            _errorMessage.value = "Scanner not available. Close and reopen the hunt screen."
+            isHunting.set(false)
+            return
+        }
+
         _huntSource.value = source
         targetMac = macAddress.uppercase()
         isWifiTarget = source == DeviceSource.WIFI_HOTSPOT || source == DeviceSource.WIFI_NETWORK
+        _huntDevice.value = null
 
-        _isScanning.value = true
-        _isFound.value = false
-        _errorMessage.value = null
-        _rssi.value = -100
-        _distance.value = 999.0
-        _smoothedDistance.value = 999.0
-        _proximityLevel.value = ProximityLevel.SEARCHING
-        _accuracy.value = 0.0
-        _direction.value = Direction.SEARCHING
+        resetHuntState()
 
-        distanceSmoother.reset()
-        rssiSmoother.reset()
+        ensureScannerRunning(scanner)
 
-        if (isWifiTarget) {
-            startWiFiHunt()
-        } else {
-            startBluetoothHunt()
-        }
-
-        startStaleMonitor()
+        startHuntLoop()
         startBeepUpdater()
     }
 
@@ -148,11 +133,27 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
         AlarmManager.stopAll()
 
+        val scanner = unifiedScanner
+        if (scanner == null) {
+            _errorMessage.value = "Scanner not available. Close and reopen the hunt screen."
+            isHunting.set(false)
+            return
+        }
+
         _huntDevice.value = target
         _huntSource.value = target.source
         targetMac = target.macAddress.uppercase()
         isWifiTarget = target.source == DeviceSource.WIFI_HOTSPOT || target.source == DeviceSource.WIFI_NETWORK
 
+        resetHuntState()
+
+        ensureScannerRunning(scanner)
+
+        startHuntLoop()
+        startBeepUpdater()
+    }
+
+    private fun resetHuntState() {
         _isScanning.value = true
         _isFound.value = false
         _errorMessage.value = null
@@ -162,93 +163,54 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         _proximityLevel.value = ProximityLevel.SEARCHING
         _accuracy.value = 0.0
         _direction.value = Direction.SEARCHING
+        _directionConfidence.value = 0
 
         distanceSmoother.reset()
         rssiSmoother.reset()
-
-        if (isWifiTarget) {
-            startWiFiHunt()
-        } else {
-            startBluetoothHunt()
-        }
-
-        startStaleMonitor()
-        startBeepUpdater()
+        directionDetector.stop()
+        lastRssiUpdate.set(0L)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun startBluetoothHunt() {
-        try {
-            if (!hasBlePermission()) {
-                _errorMessage.value = "BLE permission required"
-                isHunting.set(false)
-                return
+    private fun ensureScannerRunning(scanner: UnifiedScanner) {
+        if (scanner.isScanning.value != true) {
+            Log.d(TAG, "Starting shared unified scan for hunt")
+            try {
+                scanner.startScanning()
+            } catch (e: Exception) {
+                Log.e(TAG, "Scanner start error", e)
             }
+        }
+    }
 
-            scanCallback = object : ScanCallback() {
-                override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    if (result.device.address.equals(targetMac, true)) {
-                        processReading(result.rssi)
-                    }
-                }
-
-                override fun onBatchScanResults(results: MutableList<ScanResult>) {
-                    results.forEach {
-                        if (it.device.address.equals(targetMac, true)) {
-                            processReading(it.rssi)
+    private fun startHuntLoop() {
+        huntJob?.cancel()
+        huntJob = viewModelScope.launch(Dispatchers.IO) {
+            Log.d(TAG, "Hunt loop started for $targetMac (wifi=$isWifiTarget)")
+            while (isActive && isHunting.get()) {
+                val liveRssi = unifiedScanner?.getLiveRssi(targetMac, isWifiTarget)
+                if (liveRssi != null) {
+                    processReading(liveRssi)
+                } else {
+                    val now = System.currentTimeMillis()
+                    val last = lastRssiUpdate.get()
+                    if (last > 0 && now - last > STALE_TIMEOUT_MS) {
+                        viewModelScope.launch(Dispatchers.Main) {
+                            _rssi.value = -100
+                            _distance.value = 999.0
+                            _smoothedDistance.value = 999.0
+                            _proximityLevel.value = ProximityLevel.OUT_OF_RANGE
+                            _isFound.value = false
+                            _accuracy.value = 0.0
                         }
                     }
                 }
-
-                override fun onScanFailed(errorCode: Int) {
-                    Log.e(TAG, "Scan failed: $errorCode")
-                    _errorMessage.value = "Scan error: $errorCode"
-                }
+                delay(POLL_INTERVAL_MS)
             }
-
-            val settings = ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                .setReportDelay(0)
-                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-                .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-                .build()
-
-            bluetoothLeScanner?.startScan(null, settings, scanCallback)
-            Log.d(TAG, "BLE hunt started for $targetMac")
-        } catch (e: SecurityException) {
-            _errorMessage.value = "Permission denied"
-            isHunting.set(false)
-            Log.e(TAG, "Security", e)
-        } catch (e: Exception) {
-            _errorMessage.value = "Error: ${e.message}"
-            isHunting.set(false)
-            Log.e(TAG, "Error", e)
+            Log.d(TAG, "Hunt loop stopped")
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun startWiFiHunt() {
-        wifiHuntJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive && isHunting.get()) {
-                try {
-                    wifiManager?.startScan()
-                    delay(500)
-                    wifiManager?.scanResults?.find {
-                        it.BSSID.equals(targetMac, true)
-                    }?.let {
-                        processReading(it.level, isWifi = true)
-                    }
-                    delay(1000)
-                } catch (e: Exception) {
-                    Log.e(TAG, "WiFi hunt error", e)
-                    delay(2000)
-                }
-            }
-        }
-    }
-
-    private fun processReading(rawRssi: Int, isWifi: Boolean = false) {
+    private fun processReading(rawRssi: Int) {
         val smoothedRssi = rssiSmoother.addReading(rawRssi)
         val rawDistance = DistanceCalculator.calculateDistance(smoothedRssi, isWifi = isWifiTarget)
         val smoothed = distanceSmoother.update(rawDistance)
@@ -266,6 +228,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
             _accuracy.value = DistanceCalculator.getAccuracyEstimate(smoothedRssi)
             _isFound.value = smoothed < 0.5
             _direction.value = directionDetector.directionToDevice
+            _directionConfidence.value = directionDetector.confidence
 
             Log.d(TAG, "RSSI: $smoothedRssi | Distance: ${String.format("%.2f", smoothed)}m")
         }
@@ -321,24 +284,6 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun startStaleMonitor() {
-        timeoutJob?.cancel()
-        timeoutJob = viewModelScope.launch {
-            while (isActive && isHunting.get()) {
-                delay(1000)
-                val elapsed = System.currentTimeMillis() - lastRssiUpdate.get()
-                if (elapsed > STALE_TIMEOUT_MS && lastRssiUpdate.get() > 0) {
-                    _rssi.value = -100
-                    _distance.value = 999.0
-                    _smoothedDistance.value = 999.0
-                    _proximityLevel.value = ProximityLevel.OUT_OF_RANGE
-                    _isFound.value = false
-                    _accuracy.value = 0.0
-                }
-            }
-        }
-    }
-
     private fun getProximityLevel(distance: Double): ProximityLevel {
         return when {
             distance < 0.3 -> ProximityLevel.FOUND
@@ -351,7 +296,6 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    @SuppressLint("MissingPermission")
     fun stopHunting() {
         Log.d(TAG, "Stop hunting")
         isHunting.set(false)
@@ -359,36 +303,14 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         _huntDevice.value = null
 
         huntJob?.cancel()
-        wifiHuntJob?.cancel()
-        timeoutJob?.cancel()
         beepJob?.cancel()
 
         AlarmManager.stopAll()
-
-        try {
-            scanCallback?.let { bluetoothLeScanner?.stopScan(it) }
-            scanCallback = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Stop error", e)
-        }
-
         directionDetector.stop()
     }
 
     fun markAsFound() {
         stopHunting()
-    }
-
-    private fun hasBlePermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ActivityCompat.checkSelfPermission(
-                getApplication(), Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-        } else {
-            ActivityCompat.checkSelfPermission(
-                getApplication(), Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-        }
     }
 
     override fun onCleared() {

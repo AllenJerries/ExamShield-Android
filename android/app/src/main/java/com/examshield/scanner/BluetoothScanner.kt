@@ -12,6 +12,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import com.examshield.data.models.DeviceSource
+import com.examshield.data.models.DeviceType
 import com.examshield.data.models.UnifiedDevice
 import com.examshield.data.models.ScanResult as AppScanResult
 import kotlinx.coroutines.channels.awaitClose
@@ -103,7 +104,6 @@ class BluetoothScanner(private val context: Context) {
             scanRecord = result.scanRecord?.bytes,
             isFromWifi = false
         )
-        if (!classification.shouldShow) return
 
         val now = System.currentTimeMillis()
         val existing = discoveredDevices[mac]
@@ -127,6 +127,7 @@ class BluetoothScanner(private val context: Context) {
 
     private fun emitDevices() {
         _devices.value = discoveredDevices.values
+            .filter { it.deviceType != DeviceType.UNKNOWN }
             .sortedBy { it.proximityScore }
             .toList()
     }
@@ -154,6 +155,12 @@ class BluetoothScanner(private val context: Context) {
         discoveredDevices.clear()
         emitDevices()
     }
+
+    fun getDeviceRssi(mac: String): Int? = discoveredDevices[mac.uppercase()]?.rssi
+
+    fun getDevice(mac: String): UnifiedDevice? = discoveredDevices[mac.uppercase()]
+
+    fun isCurrentlyScanning(): Boolean = isScanning
 
     @SuppressLint("MissingPermission")
     fun startScan(durationSeconds: Int = 20): Flow<AppScanResult> = callbackFlow {
