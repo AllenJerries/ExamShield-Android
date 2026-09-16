@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
@@ -43,7 +44,9 @@ class BluetoothScanner(private val context: Context) {
     companion object {
         private const val TAG = "BluetoothScanner"
         private const val SCAN_RESTART_INTERVAL = 20000L
-        private const val STALE_DEVICE_TIMEOUT = 10000L
+        // Active-only eviction: any device whose last signal update is older
+        // than 3s is a stale/offline presence and is purged from the live list.
+        private const val STALE_DEVICE_TIMEOUT = 3000L
         private const val CLEANUP_INTERVAL = 3000L
         private const val CLASSIC_BONDED_REFRESH_MS = 3000L
         private const val CLASSIC_NOMINAL_RSSI = -90
@@ -58,6 +61,12 @@ class BluetoothScanner(private val context: Context) {
     private val isScanning = AtomicBoolean(false)
     private val deviceMap = ConcurrentHashMap<String, AppScanResult>()
     private var currentCallback: ScanCallback? = null
+
+    // Per-MAC last emitted RSSI. Lets callbacks that repeat the same reading
+    // (cached advertisements) refresh the internal map/timestamps without
+    // rebuilding + re-emitting the whole StateFlow list on every single hit,
+    // which is what keeps discovery zero-lag.
+    private val lastEmittedRssi = ConcurrentHashMap<String, Int>()
 
     private val _discoveredDevices = MutableStateFlow<List<AppScanResult>>(emptyList())
     val discoveredDevices: StateFlow<List<AppScanResult>> = _discoveredDevices.asStateFlow()
@@ -225,10 +234,17 @@ class BluetoothScanner(private val context: Context) {
             val isNew = deviceMap.putIfAbsent(mac, scanResult) == null
             if (isNew) {
                 totalDevicesFound.incrementAndGet()
+                lastEmittedRssi[mac] = rssi
+                emitDevices()
             } else {
+                // Always keep the map + timestamp fresh for stale-eviction;
+                // only rebuild/emit the list when the RSSI actually changed.
                 deviceMap[mac] = scanResult
+                if (lastEmittedRssi[mac] != rssi) {
+                    lastEmittedRssi[mac] = rssi
+                    emitDevices()
+                }
             }
-            emitDevices()
         } catch (e: Exception) {
             Log.e(TAG, "Process error", e)
         }
@@ -294,7 +310,10 @@ class BluetoothScanner(private val context: Context) {
             now - it.value.timestamp > STALE_DEVICE_TIMEOUT
         }.keys
         if (staleKeys.isNotEmpty()) {
-            staleKeys.forEach { deviceMap.remove(it) }
+            staleKeys.forEach {
+                deviceMap.remove(it)
+                lastEmittedRssi.remove(it)
+            }
             emitDevices()
             Log.d(TAG, "Cleaned ${staleKeys.size} stale devices")
         }
@@ -323,6 +342,7 @@ class BluetoothScanner(private val context: Context) {
 
     fun clearDevices() {
         deviceMap.clear()
+        lastEmittedRssi.clear()
         classicMacs.clear()
         emitDevices()
     }
@@ -406,9 +426,44 @@ class BluetoothScanner(private val context: Context) {
     @SuppressLint("MissingPermission")
     private fun refreshBondedDevices() {
         try {
+            val now = System.currentTimeMillis()
             bluetoothAdapter?.bondedDevices?.forEach { device ->
-                upsertClassicDevice(device, CLASSIC_NOMINAL_RSSI)
+                val mac = device.address?.uppercase() ?: return@forEach
+
+                val existing = deviceMap[mac]
+                val existingFresh = existing != null &&
+                    now - existing.timestamp <= STALE_DEVICE_TIMEOUT
+
+                val isConnected = try {
+                    val connected = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        bluetoothManager?.getConnectionState(device) ==
+                            BluetoothProfile.STATE_CONNECTED
+                    } else {
+                        @Suppress("DEPRECATION")
+                        device.isConnected
+                    }
+                    connected
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Cannot check connection state for $mac: ${e.message}")
+                    false
+                } catch (e: Exception) {
+                    false
+                }
+
+                if (isConnected || existingFresh) {
+                    // Active presence: either the radio is connected right now
+                    // or a live BLE/Classic scan result refreshed this MAC
+                    // within the 3s window. Keep it in the live list.
+                    upsertClassicDevice(device, CLASSIC_NOMINAL_RSSI)
+                } else {
+                    // Offline previously-paired device with no fresh scan or
+                    // live connection: purge it from the active list.
+                    if (deviceMap.remove(mac) != null || classicMacs.remove(mac)) {
+                        lastEmittedRssi.remove(mac)
+                    }
+                }
             }
+            emitDevices()
         } catch (e: SecurityException) {
             Log.w(TAG, "Cannot read bonded devices: ${e.message}")
         }
@@ -449,7 +504,10 @@ class BluetoothScanner(private val context: Context) {
                 scanRecord = existing?.scanRecord,
                 timestamp = System.currentTimeMillis()
             )
-            emitDevices()
+            if (lastEmittedRssi[mac] != finalRssi) {
+                lastEmittedRssi[mac] = finalRssi
+                emitDevices()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Upsert classic device error", e)
         }

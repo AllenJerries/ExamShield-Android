@@ -336,7 +336,7 @@ fun ExamActiveScreen(
                                         fontSize = 14.sp
                                     )
                                     Text(
-                                        text = "${device.description} \u2022 ${formatDistanceHuman(device.rssi)}",
+                                        text = "${device.description} \u2022 ${formatDistanceHuman(device.rssi, device.source)}",
                                         color = Color.White.copy(alpha = 0.8f),
                                         fontSize = 12.sp
                                     )

@@ -7,7 +7,6 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.util.Log
 import kotlin.math.abs
-import kotlin.math.pow
 import kotlin.math.sqrt
 
 enum class Direction {
@@ -22,16 +21,20 @@ enum class Direction {
 }
 
 /**
- * Combines device orientation (rotation vector + linear acceleration) with
- * live signal-strength deltas to produce a movement-aware direction pointer.
+ * Combines device orientation (rotation vector + accelerometer/magnetometer
+ * fallback at SENSOR_DELAY_GAME) with a 2-sample signal gradient (deltaRSSI)
+ * to produce a near-zero-lag direction pointer.
  *
- * Calibration notes:
- *  - Sample & stability thresholds are tuned so the pointer leaves SEARCHING
- *    after ~3-5 walking steps (a handful of RSSI readings).
- *  - When the compass heading fluctuates (large spread inside the analysis
- *    window) the detector falls back to the last *stable* heading combined
- *    with the smoothed RSSI gradient, so the arrow still points instead of
- *    freezing in "SEARCHING...".
+ * Gradient rules:
+ *  - deltaRSSI >  +0.8 dBm -> signal strengthening -> arrow toward current azimuth
+ *  - deltaRSSI <  -0.8 dBm -> signal weakening   -> arrow rotated 180 degrees
+ *  - |deltaRSSI| <= 0.8    -> no azimuth update (pointer held)
+ *
+ * The 2-sample window (last smoothed RSSI minus the one before it) flips the
+ * arrow within 1-2 steps. The detector leaves "SEARCHING..." after 2
+ * consecutive compass heading updates; when the compass heading fluctuates
+ * (large spread) it falls back to the last stable heading combined with the
+ * smoothed RSSI gradient.
  */
 class DirectionDetector(context: Context) : SensorEventListener {
 
@@ -82,13 +85,22 @@ class DirectionDetector(context: Context) : SensorEventListener {
     private val history = mutableListOf<SignalPoint>()
     private val maxHistorySize = 24
 
-    // Calibrated (lower) thresholds so SEARCHING clears within a few steps
-    private val minReadingsForAnalysis = 3
-    private val minRecentReadings = 3
+    // Calibrated (low) thresholds so SEARCHING clears within 1-2 steps
+    private val minReadingsForAnalysis = 2
+    private val minRecentReadings = 2
     private val recentWindowMs = 8_000L
     private val minStableDirectionCount = 3
-    private val minTrendMagnitude = 0.05
     private val maxHeadingSpreadForTrust = 60f
+
+    // Signal-gradient rule: 2-sample sliding window of smoothed RSSI keeps the
+    // arrow reacting to the very last RSSI delta (1-2 steps of movement).
+    private val RSSI_WINDOW_SIZE = 2
+    private val DELTA_RSSI_THRESHOLD = 0.8
+    private val rssiWindow = ArrayDeque<Int>()
+
+    // Compass lock — leaves SEARCHING after 2 consecutive heading updates.
+    private var compassUpdateCount = 0
+    private val compassLock: Boolean get() = compassUpdateCount >= 2
 
     var directionToDevice: Direction = Direction.SEARCHING
         private set
@@ -118,8 +130,12 @@ class DirectionDetector(context: Context) : SensorEventListener {
         usingFallback = false
         haveGravity = false
         haveMagnetic = false
+        rssiWindow.clear()
+        compassUpdateCount = 0
 
-        val delay = SensorManager.SENSOR_DELAY_UI
+        // SENSOR_DELAY_GAME (~50Hz) — instant orientation response when turning
+        // the phone so the arrow tracks the compass without perceptible lag.
+        val delay = SensorManager.SENSOR_DELAY_GAME
         rotationSensor?.let { sensorManager.registerListener(this, it, delay) }
         accelerometer?.let { sensorManager.registerListener(this, it, delay) }
         // Fallback sensors for devices lacking TYPE_ROTATION_VECTOR.
@@ -130,6 +146,8 @@ class DirectionDetector(context: Context) : SensorEventListener {
     fun stop() {
         sensorManager.unregisterListener(this)
         history.clear()
+        rssiWindow.clear()
+        compassUpdateCount = 0
         directionToDevice = Direction.SEARCHING
         confidence = 0f
         usingFallback = false
@@ -213,6 +231,7 @@ class DirectionDetector(context: Context) : SensorEventListener {
     }
 
     private fun updateSmoothedHeading(rawHeading: Float) {
+        compassUpdateCount++
         if (!headingInitialized) {
             smoothedHeading = rawHeading
             lastHeadingSample = rawHeading
@@ -246,6 +265,12 @@ class DirectionDetector(context: Context) : SensorEventListener {
 
     fun addSignalReading(rssi: Int) {
         val now = System.currentTimeMillis()
+
+        // 2-sample sliding window of smoothed RSSI values for deltaRSSI.
+        rssiWindow.addLast(rssi)
+        while (rssiWindow.size > RSSI_WINDOW_SIZE) {
+            rssiWindow.removeFirst()
+        }
 
         history.add(SignalPoint(
             rssi = rssi,
@@ -282,12 +307,8 @@ class DirectionDetector(context: Context) : SensorEventListener {
             return
         }
 
-        // Combine the least-squares slope with a moving-average RSSI delta so
-        // transient dips are smoothed and the gradient points the same way
-        // whether the user walks slowly (few samples) or fast (many samples).
-        val regressionTrend = calculateTrend(recent)
-        val movingTrend = movingAverageRssiDelta(recent)
-        val trend = regressionTrend * 0.5 + movingTrend * 0.5
+        // Signal gradient from the 2-sample sliding window of smoothed RSSI.
+        val deltaRssi = windowDeltaRssi()
 
         val headings = recent.map { it.heading }
         val avgHeading = headings.average().toFloat()
@@ -307,9 +328,13 @@ class DirectionDetector(context: Context) : SensorEventListener {
 
         val userDirection = getHeadingDirection(reliableHeading)
 
+        // 2) Gradient rule for the target direction angle:
+        //      deltaRSSI >  +0.8 -> signal strengthening -> arrow toward azimuth
+        //      deltaRSSI <  -0.8 -> signal weakening   -> arrow rotated 180 deg
+        //      |deltaRSSI| <= 0.8 -> no azimuth update
         val trendDirection = when {
-            abs(trend) < minTrendMagnitude -> null
-            trend > 0 -> userDirection
+            abs(deltaRssi) < DELTA_RSSI_THRESHOLD -> null
+            deltaRssi > 0 -> userDirection
             else -> getOppositeDirection(userDirection)
         }
 
@@ -321,20 +346,30 @@ class DirectionDetector(context: Context) : SensorEventListener {
                 directionStableCount = 0
             }
 
-            if (directionStableCount >= minStableDirectionCount) {
+            // Once the compass has produced 2 consecutive heading updates a
+            // single gradient reading is enough to clear the SEARCHING state.
+            val requiredStability = if (compassLock) 1 else minStableDirectionCount
+            if (directionStableCount >= requiredStability) {
                 directionToDevice = trendDirection
             }
 
-            val trendConfidence = abs(trend).toFloat() * 100f
+            val trendConfidence = abs(deltaRssi).toFloat() * 100f
             confidence = (
                 trendConfidence + directionStableCount * 12f
                 ) * (if (usingFallback) 0.7f else 1.0f)
                 .coerceIn(5f, 100f)
         } else {
-            // No meaningful gradient yet — hold current pointer instead of
+            // No meaningful gradient yet. Hold the current pointer instead of
             // dropping back to SEARCHING once a cardinal direction is known.
             if (directionToDevice == Direction.SEARCHING) {
-                confidence = 15f
+                if (compassLock) {
+                    // 2 compass heading updates received -> exit SEARCHING and
+                    // aim the arrow along the current azimuth.
+                    directionToDevice = userDirection
+                    confidence = 20f
+                } else {
+                    confidence = 15f
+                }
             } else {
                 confidence = (confidence * 0.9f).coerceAtLeast(5f)
             }
@@ -342,52 +377,19 @@ class DirectionDetector(context: Context) : SensorEventListener {
 
         Log.d(
             TAG,
-            "Direction: $directionToDevice | Trend: $trend | " +
-                "Conf: ${confidence.toInt()} | Fallback: $usingFallback"
+            "Direction: $directionToDevice | deltaRSSI: $deltaRssi | " +
+                "Heading: $reliableHeading | Conf: ${confidence.toInt()} | " +
+                "CompassLock: $compassLock"
         )
     }
 
     /**
-     * Signal strength trend (linear regression over reading index).
-     * Positive => increasing signal (closer), negative => decreasing.
+     * Newest smoothed RSSI minus the previous smoothed RSSI inside the
+     * 2-sample sliding window. Live as soon as 2 readings have arrived.
      */
-    private fun calculateTrend(readings: List<SignalPoint>): Double {
-        if (readings.size < 2) return 0.0
-
-        val n = readings.size
-        val xValues = readings.mapIndexed { i, _ -> i.toDouble() }
-        val yValues = readings.map { it.rssi.toDouble() }
-
-        val xMean = xValues.average()
-        val yMean = yValues.average()
-
-        var numerator = 0.0
-        var denominator = 0.0
-
-        for (i in 0 until n) {
-            numerator += (xValues[i] - xMean) * (yValues[i] - yMean)
-            denominator += (xValues[i] - xMean).pow(2)
-        }
-
-        return if (denominator != 0.0) numerator / denominator else 0.0
-    }
-
-    /**
-     * Moving-average RSSI delta across the recent-reading window: average
-     * signal in the newest half minus average signal in the oldest half.
-     * Positive => signal strengthened while walking (device ahead).
-     */
-    private fun movingAverageRssiDelta(readings: List<SignalPoint>): Double {
-        if (readings.size < 2) return 0.0
-
-        val half = (readings.size / 2).coerceAtLeast(1)
-        val older = readings.take(half)
-        val newer = readings.takeLast(half)
-
-        val olderAvg = older.map { it.rssi.toDouble() }.average()
-        val newerAvg = newer.map { it.rssi.toDouble() }.average()
-
-        return newerAvg - olderAvg
+    private fun windowDeltaRssi(): Double {
+        if (rssiWindow.size < RSSI_WINDOW_SIZE) return 0.0
+        return (rssiWindow.last() - rssiWindow.first()).toDouble()
     }
 
     private fun computeHeadingSpread(headings: List<Float>): Float {

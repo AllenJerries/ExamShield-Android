@@ -29,7 +29,11 @@ class WifiScanner(private val context: Context) {
     companion object {
         private const val TAG = "WifiScanner"
         private const val WIFI_SCAN_INTERVAL_MS = 30_000L
-        private const val WIFI_STALE_TIMEOUT_MS = 120_000L
+        // Active-only eviction: networks that have not produced a fresh scan
+        // result within 3s are stale and are purged from the live list, so an
+        // offline/out-of-range access point can never linger as a "threat".
+        private const val WIFI_STALE_TIMEOUT_MS = 3_000L
+        private const val WIFI_CLEANUP_INTERVAL_MS = 3_000L
     }
 
     private val wifiManager = context.applicationContext.getSystemService(
@@ -42,6 +46,7 @@ class WifiScanner(private val context: Context) {
     private val deviceMap = ConcurrentHashMap<String, ScanResult>()
     private var scanReceiver: BroadcastReceiver? = null
     private var scanJob: Job? = null
+    private var cleanupJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val isScanning = AtomicBoolean(false)
 
@@ -100,10 +105,18 @@ class WifiScanner(private val context: Context) {
                     Log.d(TAG, "WiFi scan attempt #$attempt: ${if (started) "OK" else "THROTTLED"}")
 
                     processScanResults()
+                    cleanupStaleDevices()
 
                     interval = if (started) WIFI_SCAN_INTERVAL_MS else 45_000L
                 }
                 delay(interval)
+            }
+        }
+
+        cleanupJob = scope.launch {
+            while (isActive && isScanning.get()) {
+                cleanupStaleDevices()
+                delay(WIFI_CLEANUP_INTERVAL_MS)
             }
         }
     }
@@ -207,6 +220,8 @@ class WifiScanner(private val context: Context) {
         isScanning.set(false)
         scanJob?.cancel()
         scanJob = null
+        cleanupJob?.cancel()
+        cleanupJob = null
         safeExecute("Unregister receiver") {
             scanReceiver?.let { context.unregisterReceiver(it) }
             scanReceiver = null

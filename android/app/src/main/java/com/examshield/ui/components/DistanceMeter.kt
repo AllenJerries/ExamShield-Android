@@ -101,7 +101,7 @@ fun DistanceMeter(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = formatDistanceHuman(rssi),
+                text = formatDistanceHuman(rssi, source),
                 style = MaterialTheme.typography.titleMedium,
                 color = color
             )

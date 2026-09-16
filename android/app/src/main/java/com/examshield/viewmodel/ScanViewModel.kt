@@ -52,6 +52,27 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * Returns true for devices classified as an active cheating threat
+     * (CRITICAL / HIGH risk) — these always sort above low-risk noise.
+     */
+    private fun isHighRiskDevice(device: UnifiedDevice): Boolean {
+        return device.riskLevel == RiskLevel.CRITICAL ||
+            device.riskLevel == RiskLevel.HIGH
+    }
+
+    /**
+     * Dynamic output ordering: high-risk active threats first, then by
+     * ascending calculated distance so the closest cheating device is always
+     * rendered at the very top of the list.
+     */
+    private fun sortForDisplay(devices: List<UnifiedDevice>): List<UnifiedDevice> {
+        return devices.sortedWith(
+            compareByDescending<UnifiedDevice> { isHighRiskDevice(it) }
+                .thenBy { it.estimatedDistance }
+        )
+    }
+
     private val db = AppDatabase.getDatabase(application)
     private val deviceRepository = DeviceRepository(db)
     private val examRepository = ExamRepository(db)
@@ -70,6 +91,12 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     private val historyRepository = HistoryRepository(application)
 
     val unifiedDevices: StateFlow<List<UnifiedDevice>> = unifiedScanner.devices
+        .map { sortForDisplay(it) }
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            sortForDisplay(unifiedScanner.devices.value)
+        )
     val isUnifiedScanning: StateFlow<Boolean> = unifiedScanner.isScanning
     val scanStats: StateFlow<com.examshield.scanner.ScanStats> = unifiedScanner.scanStats
     val scanStatus: StateFlow<ScanStatus> = unifiedScanner.scanStatus
@@ -342,7 +369,10 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     private fun processUnifiedDevices(deviceList: List<UnifiedDevice>, examId: Long) {
         val unauthorized = deviceList.filter { device ->
             !whitelistMacs.containsKey(device.macAddress.uppercase())
-        }.sortedBy { it.proximityScore }
+        }.sortedWith(
+            compareByDescending<UnifiedDevice> { isHighRiskDevice(it) }
+                .thenBy { it.estimatedDistance }
+        )
 
         val existingWhitelisted = allDetectedDevices.values
             .filter { it.isWhitelisted }
@@ -353,7 +383,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
             device.macAddress.uppercase() !in existingWhitelisted
         }
 
-        _sortedUnauthorizedDevices.value = trulyUnauthorized
+        _sortedUnauthorizedDevices.value = sortForDisplay(trulyUnauthorized)
         _lastScanTime.value = System.currentTimeMillis()
 
         checkForAlerts(trulyUnauthorized)

@@ -72,8 +72,8 @@ data class UnifiedDevice(
     companion object {
         fun calculateDistance(rssi: Int): Double {
             if (rssi == 0 || rssi <= -100) return 999.0
-            val txPower = -55
-            val ratio = (txPower - rssi).toDouble() / 28.0
+            // Bluetooth-calibrated Log-Distance Path Loss: A = -59 dBm, n = 2.2
+            val ratio = (-59.0 - rssi) / (10.0 * 2.2)
             return Math.pow(10.0, ratio).coerceIn(0.05, 100.0)
         }
     }

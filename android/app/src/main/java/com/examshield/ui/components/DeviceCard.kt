@@ -166,7 +166,7 @@ fun DeviceCard(
                         )
                         Spacer(Modifier.width(2.dp))
                         Text(
-                            text = formatDistanceHuman(device.rssi),
+                            text = formatDistanceHuman(device.rssi, device.source),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 11.sp
@@ -285,7 +285,7 @@ fun LegacyDeviceCard(
         else -> Color(0xFF1976D2)
     }
 
-    val distance = calculateDistanceFromRssi(device.rssi)
+    val distance = calculateDistanceFromRssi(device.rssi, sourceFromLegacyDevice(device))
     val distanceText = formatDistanceShort(distance)
 
     Card(
@@ -375,7 +375,7 @@ fun LegacyDeviceCard(
                         )
                         Spacer(Modifier.width(2.dp))
                         Text(
-                            text = formatDistanceHuman(device.rssi),
+                            text = formatDistanceHuman(device.rssi, sourceFromLegacyDevice(device)),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -446,5 +446,17 @@ fun getSourceColor(source: DeviceSource): Color {
         DeviceSource.BLUETOOTH -> Color(0xFF2196F3)
         DeviceSource.WIFI_NETWORK -> Color(0xFF9C27B0)
         DeviceSource.WIFI_HOTSPOT -> Color(0xFFE53935)
+    }
+}
+
+/**
+ * Legacy cards render the Room [Device] entity, which carries only a plain
+ * string deviceType. Map it to a [DeviceSource] so RSSI->distance uses the
+ * correct radio (WiFi access points are calibrated differently from BLE).
+ */
+fun sourceFromLegacyDevice(device: Device): DeviceSource {
+    return when (device.deviceType.uppercase()) {
+        "WIFI", "WIFI_AP", "WIFI_NETWORK", "ROUTER" -> DeviceSource.WIFI_NETWORK
+        else -> DeviceSource.BLUETOOTH
     }
 }

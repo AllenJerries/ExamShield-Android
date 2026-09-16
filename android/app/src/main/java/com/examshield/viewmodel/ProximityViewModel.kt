@@ -22,10 +22,13 @@ import com.examshield.scanner.DirectionDetector
 import com.examshield.scanner.ScannerProvider
 import com.examshield.utils.AlarmManager
 import com.examshield.utils.BeepManager
+import com.examshield.utils.BeepManager.BeepProfile
 import com.examshield.utils.DistanceCalculator
 import com.examshield.utils.ProximityLevel
+import com.examshield.utils.RssiEmaSmoother
 import com.examshield.utils.SettingsRepository
 import com.examshield.utils.VibrationHelper
+import com.examshield.utils.calculateDistanceFromRssi
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -40,13 +43,14 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         private const val STALE_TIMEOUT_MS = 3000L
 
         // Live-RSSI poll cadences
-        private const val POLL_INTERVAL_MS = 300L
+        // 80ms keeps distance/audio feedback <=100ms behind a raw RSSI change.
+        private const val POLL_INTERVAL_MS = 80L
         private const val WIFI_SCAN_THROTTLE_MS = 15_000L
 
         // Skip double-feeding the same raw reading into the smoothers
-        // when the direct scan callback and the 300ms fallback poll
-        // observe the exact same value within the same window.
-        private const val DEDUPE_WINDOW_MS = 300L
+        // when the direct scan callback and the fallback poll observe the
+        // exact same value within the same window.
+        private const val DEDUPE_WINDOW_MS = 80L
     }
 
     private val _rssi = MutableStateFlow(-100)
@@ -79,6 +83,15 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val _directionConfidence = MutableStateFlow(0f)
     val directionConfidence: StateFlow<Float> = _directionConfidence.asStateFlow()
 
+    // Dynamic audio feedback parameters (volume / pitch / interval) resolved
+    // from the current smoothed RSSI and streamed to the hunter screen.
+    private val _audioFeedback = MutableStateFlow<BeepProfile?>(null)
+    val audioFeedback: StateFlow<BeepProfile?> = _audioFeedback.asStateFlow()
+
+    // Current compass azimuth (deg) from the sensor-fusion direction detector.
+    private val _azimuth = MutableStateFlow(0f)
+    val azimuth: StateFlow<Float> = _azimuth.asStateFlow()
+
     private val _huntSource = MutableStateFlow(DeviceSource.BLUETOOTH)
     val huntSource: StateFlow<DeviceSource> = _huntSource.asStateFlow()
 
@@ -91,7 +104,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val unifiedScanner = ScannerProvider.get(application)
 
     private val distanceSmoother = DistanceCalculator.DistanceSmoother()
-    private val rssiSmoother = DistanceCalculator.RSSISmoother(bufferSize = 5)
+    private val rssiSmoother = RssiEmaSmoother(alpha = 0.75)
 
     private val directionDetector = DirectionDetector(application)
 
@@ -199,6 +212,8 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         _accuracy.value = 0.0
         _direction.value = Direction.SEARCHING
         _directionConfidence.value = 0f
+        _audioFeedback.value = null
+        _azimuth.value = 0f
     }
 
     @SuppressLint("MissingPermission")
@@ -321,11 +336,11 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun processReading(rawRssi: Int, isWifi: Boolean = false) {
+    fun processReading(rawRssi: Int, isWifi: Boolean = false) {
         if (rawRssi == 0) return
 
         // Change-guard: identical raw reading observed twice within the same
-        // window (direct callback vs 300ms fallback poll) is treated as one.
+        // window (direct callback vs fallback poll) is treated as one.
         val now = System.currentTimeMillis()
         val fingerprint = (if (isWifi) 0L else 1L) * 1_000_000L + rawRssi
         if (fingerprint == lastAppliedKey.get() &&
@@ -337,33 +352,39 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         lastAppliedTime.set(now)
 
         val smoothedRssi = rssiSmoother.addReading(rawRssi)
-        val rawDistance = DistanceCalculator.calculateDistance(smoothedRssi, isWifi = isWifiTarget)
+        val rawDistance = calculateDistanceFromRssi(
+            smoothedRssi,
+            source = _huntSource.value
+        )
         val smoothed = distanceSmoother.update(rawDistance)
 
         lastRssiUpdate.set(System.currentTimeMillis())
 
         directionDetector.addSignalReading(smoothedRssi)
 
-        viewModelScope.launch(Dispatchers.Main) {
-            _rssi.value = smoothedRssi
-            _distance.value = rawDistance
-            _smoothedDistance.value = smoothed
-            _proximityLevel.value = getProximityLevel(smoothed)
-            _lastUpdate.value = System.currentTimeMillis()
-            _accuracy.value = DistanceCalculator.getAccuracyEstimate(smoothedRssi)
-            _isFound.value = smoothed < 0.5
-            _direction.value = directionDetector.directionToDevice
-            _directionConfidence.value = directionDetector.confidence
+        // Live RSSI emissions write straight into the StateFlows from the
+        // scanner thread (StateFlow is thread-safe) — no secondary dispatcher
+        // hop — keeping the gauge, arrow and audio engine exactly in sync.
+        _rssi.value = smoothedRssi
+        _distance.value = rawDistance
+        _smoothedDistance.value = smoothed
+        _proximityLevel.value = getProximityLevel(smoothed)
+        _lastUpdate.value = System.currentTimeMillis()
+        _accuracy.value = DistanceCalculator.getAccuracyEstimate(smoothedRssi)
+        _isFound.value = smoothed < 0.5
+        _direction.value = directionDetector.directionToDevice
+        _directionConfidence.value = directionDetector.confidence
+        _audioFeedback.value = BeepManager.getBeepProfile(smoothedRssi)
+        _azimuth.value = directionDetector.currentHeading
 
-            Log.d(TAG, "RSSI: $smoothedRssi | Distance: ${String.format("%.2f", smoothed)}m")
-        }
+        Log.d(TAG, "RSSI: $smoothedRssi | Distance: ${String.format("%.2f", smoothed)}m")
     }
 
     private fun startBeepUpdater() {
         beepJob?.cancel()
 
-        // Dynamic audio beeping — cadence scales with live target RSSI
-        // (> -50 -> 90 ms, -75..-50 -> 350 ms, < -75 -> 1000 ms).
+        // Dynamic audio beeping — volume, pitch (500/1000/1600 Hz) and cadence
+        // (45/180/600 ms) are all rescaled live from the smoothed target RSSI.
         BeepManager.startProximityBeeping(
             context = getApplication(),
             getRssi = { _rssi.value },
@@ -426,6 +447,8 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
                     _proximityLevel.value = ProximityLevel.OUT_OF_RANGE
                     _isFound.value = false
                     _accuracy.value = 0.0
+                    _audioFeedback.value = BeepManager.getBeepProfile(-100)
+                    _azimuth.value = 0f
                 }
             }
         }

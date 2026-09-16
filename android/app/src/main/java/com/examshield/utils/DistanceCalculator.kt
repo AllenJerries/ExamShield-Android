@@ -6,9 +6,11 @@ import kotlin.math.pow
 
 object DistanceCalculator {
 
-    private const val BLE_TX_POWER = -50
-    private const val WIFI_TX_POWER = -35
-    private const val INDOOR_PATH_LOSS = 2.0
+    // Source-calibrated Log-Distance Path Loss: d = 10^((A - rssi) / (10 * n)).
+    private const val BLE_TX_REFERENCE = -59.0
+    private const val WIFI_TX_REFERENCE = -45.0
+    private const val BLE_PATH_LOSS = 2.2
+    private const val WIFI_PATH_LOSS = 2.6
 
     fun calculateDistance(
         rssi: Int,
@@ -16,9 +18,10 @@ object DistanceCalculator {
     ): Double {
         if (rssi == 0 || rssi <= -100) return 999.0
 
-        val txPower = if (isWifi) WIFI_TX_POWER else BLE_TX_POWER
+        val txReference = if (isWifi) WIFI_TX_REFERENCE else BLE_TX_REFERENCE
+        val pathLoss = if (isWifi) WIFI_PATH_LOSS else BLE_PATH_LOSS
 
-        val ratio = (txPower - rssi).toDouble() / (10 * INDOOR_PATH_LOSS)
+        val ratio = (txReference - rssi) / (10.0 * pathLoss)
         val distance = 10.0.pow(ratio)
 
         return distance.coerceIn(0.05, 100.0)
@@ -119,7 +122,7 @@ object DistanceCalculator {
 
     fun metersToApproxDbm(meters: Double): Int {
         if (meters <= 0) return 0
-        val ratio = log10(meters) * (10 * INDOOR_PATH_LOSS)
-        return (BLE_TX_POWER - ratio).toInt()
+        val ratio = log10(meters) * (10 * BLE_PATH_LOSS)
+        return (BLE_TX_REFERENCE - ratio).toInt()
     }
 }
