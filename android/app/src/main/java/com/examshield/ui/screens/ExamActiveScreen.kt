@@ -32,6 +32,7 @@ import com.examshield.ui.components.LegacyDeviceCard
 import com.examshield.ui.components.SignalInfoDialog
 import com.examshield.ui.components.DeviceTypesGuideDialog
 import com.examshield.ui.theme.*
+import com.examshield.viewmodel.DeviceCategoryFilter
 import com.examshield.viewmodel.ScanViewModel
 
 private const val TAG = "ExamShield_Scan"
@@ -66,6 +67,7 @@ fun ExamActiveScreen(
     val scanStatus by scanViewModel.scanStatus.collectAsState()
     val bleActive by scanViewModel.bleActive.collectAsState()
     val wifiActive by scanViewModel.wifiActive.collectAsState()
+    val categoryFilter by scanViewModel.deviceCategoryFilter.collectAsState()
     var showEndDialog by remember { mutableStateOf(false) }
     var showInfoDialog by remember { mutableStateOf(false) }
     var showDeviceGuide by remember { mutableStateOf(false) }
@@ -97,6 +99,10 @@ fun ExamActiveScreen(
 
     val relevantDevices = remember(sortedUnauthorizedDevices) {
         sortedUnauthorizedDevices.filter { it.deviceType in RELEVANT_TYPES }
+    }
+
+    val visibleDevices = remember(relevantDevices, categoryFilter) {
+        relevantDevices.filter { scanViewModel.matchesCategory(it, categoryFilter) }
     }
 
     val criticalCount = remember(relevantDevices) {
@@ -223,6 +229,47 @@ fun ExamActiveScreen(
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
+            // ── Category filter chips ───────────────────────────────────
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    CategoryFilterChip(
+                        label = "All",
+                        icon = Icons.Default.Devices,
+                        selected = categoryFilter == DeviceCategoryFilter.ALL,
+                        color = Color(0xFF607D8B),
+                        onClick = { scanViewModel.setDeviceCategoryFilter(DeviceCategoryFilter.ALL) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    CategoryFilterChip(
+                        label = "Bluetooth",
+                        icon = Icons.Default.Bluetooth,
+                        selected = categoryFilter == DeviceCategoryFilter.BLUETOOTH,
+                        color = Color(0xFF2196F3),
+                        onClick = { scanViewModel.setDeviceCategoryFilter(DeviceCategoryFilter.BLUETOOTH) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    CategoryFilterChip(
+                        label = "WiFi",
+                        icon = Icons.Default.Wifi,
+                        selected = categoryFilter == DeviceCategoryFilter.WIFI,
+                        color = Color(0xFF9C27B0),
+                        onClick = { scanViewModel.setDeviceCategoryFilter(DeviceCategoryFilter.WIFI) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    CategoryFilterChip(
+                        label = "Hotspot",
+                        icon = Icons.Default.WifiTethering,
+                        selected = categoryFilter == DeviceCategoryFilter.HOTSPOT,
+                        color = Color(0xFFE53935),
+                        onClick = { scanViewModel.setDeviceCategoryFilter(DeviceCategoryFilter.HOTSPOT) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+
             criticalAlertDevice?.let { device ->
                 item {
                     Card(
@@ -301,7 +348,7 @@ fun ExamActiveScreen(
                 }
             }
 
-            if (relevantDevices.isNotEmpty()) {
+            if (visibleDevices.isNotEmpty()) {
                 item {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -316,7 +363,7 @@ fun ExamActiveScreen(
                         )
                         Spacer(Modifier.weight(1f))
                         Text(
-                            text = "${relevantDevices.size} found",
+                            text = "${visibleDevices.size} found",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -324,7 +371,7 @@ fun ExamActiveScreen(
                 }
 
                 items(
-                    relevantDevices,
+                    visibleDevices,
                     key = { it.macAddress }
                 ) { unifiedDevice ->
                     DeviceCard(
@@ -337,7 +384,7 @@ fun ExamActiveScreen(
                         }
                     )
                 }
-            } else {
+            } else if (categoryFilter == DeviceCategoryFilter.ALL) {
                 val legacyDevices = detectedDevices.filter { !it.isWhitelisted }
                 if (legacyDevices.isNotEmpty()) {
                     items(
@@ -358,7 +405,7 @@ fun ExamActiveScreen(
                 }
             }
 
-            if (relevantDevices.isEmpty() && detectedDevices.isEmpty()) {
+            if (visibleDevices.isEmpty() && detectedDevices.isEmpty()) {
                 item {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -387,6 +434,41 @@ fun ExamActiveScreen(
                             )
                             Text(
                                 "No threats detected",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            } else if (visibleDevices.isEmpty() && categoryFilter != DeviceCategoryFilter.ALL) {
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                when (categoryFilter) {
+                                    DeviceCategoryFilter.BLUETOOTH -> Icons.Default.Bluetooth
+                                    DeviceCategoryFilter.WIFI -> Icons.Default.Wifi
+                                    DeviceCategoryFilter.HOTSPOT -> Icons.Default.WifiTethering
+                                    DeviceCategoryFilter.ALL -> Icons.Default.Devices
+                                },
+                                null,
+                                tint = Color.Gray,
+                                modifier = Modifier.size(40.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                "No ${categoryFilter.name.lowercase()} devices found",
+                                fontSize = 14.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -456,6 +538,52 @@ fun ExamActiveScreen(
 
 
 // ============ NEW COMPOSABLES ============
+
+@Composable
+private fun CategoryFilterChip(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    color: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = {
+            Text(
+                label,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        },
+        leadingIcon = {
+            Icon(
+                icon,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp)
+            )
+        },
+        colors = FilterChipDefaults.filterChipColors(
+            containerColor = color.copy(alpha = 0.08f),
+            labelColor = color.copy(alpha = 0.7f),
+            iconColor = color.copy(alpha = 0.7f),
+            selectedContainerColor = color.copy(alpha = 0.20f),
+            selectedLabelColor = color,
+            selectedLeadingIconColor = color
+        ),
+        border = FilterChipDefaults.filterChipBorder(
+            enabled = true,
+            selected = selected,
+            borderColor = color.copy(alpha = 0.25f),
+            selectedBorderColor = color,
+            borderWidth = 1.dp,
+            selectedBorderWidth = 1.5.dp
+        ),
+        modifier = modifier.height(32.dp)
+    )
+}
 
 @Composable
 private fun ScanStatusSubtitle(scanStatus: ScanStatus) {
@@ -710,5 +838,3 @@ private fun StatItem(count: Int, label: String, color: Color) {
         )
     }
 }
-
-

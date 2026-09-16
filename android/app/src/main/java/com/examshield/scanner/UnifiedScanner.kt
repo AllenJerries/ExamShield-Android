@@ -2,6 +2,7 @@ package com.examshield.scanner
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.net.wifi.WifiManager
 import android.util.Log
 import com.examshield.data.models.DeviceSource
 import com.examshield.data.models.DeviceType
@@ -18,6 +19,8 @@ class UnifiedScanner(private val context: Context) {
         private const val TAG = "UnifiedScanner"
         private const val BLE_CLEANUP_INTERVAL_MS = 8_000L
         private const val COMBINE_INTERVAL_MS = 1_000L
+        private const val RSSI_SYNC_INTERVAL_MS = 300L
+        private const val FRESH_RSSI_MS = 20_000L
         private const val BLE_STALE_TIMEOUT_MS = 20_000L
     }
 
@@ -49,6 +52,7 @@ class UnifiedScanner(private val context: Context) {
     private var cleanupJob: Job? = null
     private var statsJob: Job? = null
     private var combineJob: Job? = null
+    private var rssiSyncJob: Job? = null
 
     @SuppressLint("MissingPermission")
     fun startScanning() {
@@ -68,6 +72,7 @@ class UnifiedScanner(private val context: Context) {
         startCleanupJob()
         startStatsUpdate()
         startCombineLoop()
+        startRssiSyncLoop()
     }
 
     fun stopScanning() {
@@ -85,6 +90,7 @@ class UnifiedScanner(private val context: Context) {
         cleanupJob?.cancel()
         statsJob?.cancel()
         combineJob?.cancel()
+        rssiSyncJob?.cancel()
     }
 
     fun manualRefresh() {
@@ -111,6 +117,54 @@ class UnifiedScanner(private val context: Context) {
         return bleDeviceMap[upper]
             ?: wifiScanner.wifiDevices.value.find { it.bssid == upper }
                 ?.let { wifiScanner.toUnifiedDevice(it) }
+    }
+
+    /**
+     * Returns the freshest RSSI known for the given target.
+     *
+     * During active scanning the underlying maps are refreshed on a 300ms
+     * cadence (see [startRssiSyncLoop]), so the value returned here tracks the
+     * live reading instead of a stale snapshot. Falls back to the raw BLE
+     * discovered-map / OS WiFi cache when the unified maps do not contain the
+     * target yet.
+     */
+    fun getLiveRssi(mac: String, isWifi: Boolean): Int? {
+        val now = System.currentTimeMillis()
+        val upper = mac.uppercase()
+
+        if (isWifi) {
+            val cached = wifiScanner.wifiDevices.value.find { it.bssid == upper }
+            if (cached != null && now - cached.lastSeen <= FRESH_RSSI_MS) {
+                return cached.rssi
+            }
+            return cachedWifiRssi(upper)
+        }
+
+        val unified = bleDeviceMap[upper]
+        if (unified != null && now - unified.lastSeen <= FRESH_RSSI_MS) {
+            return unified.rssi
+        }
+        val raw = bluetoothScanner.getDiscoveredDevices()[upper]
+        if (raw != null && now - raw.timestamp <= FRESH_RSSI_MS) {
+            return raw.rssi
+        }
+        return null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun cachedWifiRssi(bssid: String): Int? {
+        return try {
+            val wm = context.applicationContext.getSystemService(
+                Context.WIFI_SERVICE
+            ) as? WifiManager
+            wm?.scanResults
+                ?.find { it.BSSID.uppercase() == bssid }
+                ?.level
+                ?.takeIf { it != 0 }
+        } catch (e: Exception) {
+            Log.w(TAG, "cachedWifiRssi error: ${e.message}")
+            null
+        }
     }
 
     fun clearDevices() {
@@ -185,6 +239,19 @@ class UnifiedScanner(private val context: Context) {
                     Log.e(TAG, "Combine error: ${e.message}")
                 }
                 delay(COMBINE_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun startRssiSyncLoop() {
+        rssiSyncJob = scope.launch {
+            while (isScanningActive.get()) {
+                try {
+                    updateBleDeviceMap()
+                } catch (e: Exception) {
+                    Log.e(TAG, "RSSI sync error: ${e.message}")
+                }
+                delay(RSSI_SYNC_INTERVAL_MS)
             }
         }
     }

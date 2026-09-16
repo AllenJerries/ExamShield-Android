@@ -279,7 +279,8 @@ fun ProximityHunterScreen(
             DistanceMeter(
                 distance = smoothedDistance,
                 rssi = currentRssi,
-                proximityLevel = proximityLevel
+                proximityLevel = proximityLevel,
+                source = sourceEnum
             )
 
             Spacer(modifier = Modifier.height(12.dp))

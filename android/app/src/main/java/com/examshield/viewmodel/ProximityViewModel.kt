@@ -19,6 +19,7 @@ import com.examshield.data.models.DeviceSource
 import com.examshield.data.models.UnifiedDevice
 import com.examshield.scanner.Direction
 import com.examshield.scanner.DirectionDetector
+import com.examshield.scanner.ScannerProvider
 import com.examshield.utils.AlarmManager
 import com.examshield.utils.DistanceCalculator
 import com.examshield.utils.ProximityLevel
@@ -36,6 +37,15 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     companion object {
         private const val TAG = "ProximityViewModel"
         private const val STALE_TIMEOUT_MS = 3000L
+
+        // Live-RSSI poll cadences
+        private const val POLL_INTERVAL_MS = 300L
+        private const val WIFI_SCAN_THROTTLE_MS = 15_000L
+
+        // Skip double-feeding the same raw reading into the smoothers
+        // when the direct scan callback and the 300ms fallback poll
+        // observe the exact same value within the same window.
+        private const val DEDUPE_WINDOW_MS = 300L
     }
 
     private val _rssi = MutableStateFlow(-100)
@@ -77,6 +87,8 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val _accuracy = MutableStateFlow(0.0)
     val accuracy: StateFlow<Double> = _accuracy.asStateFlow()
 
+    private val unifiedScanner = ScannerProvider.get(application)
+
     private val distanceSmoother = DistanceCalculator.DistanceSmoother()
     private val rssiSmoother = DistanceCalculator.RSSISmoother(bufferSize = 5)
 
@@ -85,8 +97,8 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private var targetMac: String = ""
     private var isWifiTarget = false
     private var scanCallback: ScanCallback? = null
-    private var huntJob: Job? = null
     private var wifiHuntJob: Job? = null
+    private var bleFallbackJob: Job? = null
     private var timeoutJob: Job? = null
     private var beepJob: Job? = null
 
@@ -103,6 +115,12 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val isHunting = AtomicBoolean(false)
     private val lastRssiUpdate = AtomicLong(0)
+    private val lastDirectRssiTime = AtomicLong(0)
+    private val lastWifiScanRequested = AtomicLong(0)
+
+    // Change-guard against double-feeding the smoothers
+    private val lastAppliedKey = AtomicLong(-1)
+    private val lastAppliedTime = AtomicLong(0)
 
     fun startHunting(macAddress: String, source: DeviceSource) {
         Log.d(TAG, "START HUNT: $macAddress | $source")
@@ -118,25 +136,18 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         targetMac = macAddress.uppercase()
         isWifiTarget = source == DeviceSource.WIFI_HOTSPOT || source == DeviceSource.WIFI_NETWORK
 
-        _isScanning.value = true
-        _isFound.value = false
-        _errorMessage.value = null
-        _rssi.value = -100
-        _distance.value = 999.0
-        _smoothedDistance.value = 999.0
-        _proximityLevel.value = ProximityLevel.SEARCHING
-        _accuracy.value = 0.0
-        _direction.value = Direction.SEARCHING
-        _directionConfidence.value = 0f
+        resetHuntState()
 
         distanceSmoother.reset()
         rssiSmoother.reset()
         directionDetector.start()
+        lastAppliedTime.set(0)
 
         if (isWifiTarget) {
             startWiFiHunt()
         } else {
             startBluetoothHunt()
+            startBleFallbackPoll()
         }
 
         startStaleMonitor()
@@ -158,6 +169,25 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         targetMac = target.macAddress.uppercase()
         isWifiTarget = target.source == DeviceSource.WIFI_HOTSPOT || target.source == DeviceSource.WIFI_NETWORK
 
+        resetHuntState()
+
+        distanceSmoother.reset()
+        rssiSmoother.reset()
+        directionDetector.start()
+        lastAppliedTime.set(0)
+
+        if (isWifiTarget) {
+            startWiFiHunt()
+        } else {
+            startBluetoothHunt()
+            startBleFallbackPoll()
+        }
+
+        startStaleMonitor()
+        startBeepUpdater()
+    }
+
+    private fun resetHuntState() {
         _isScanning.value = true
         _isFound.value = false
         _errorMessage.value = null
@@ -168,19 +198,6 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         _accuracy.value = 0.0
         _direction.value = Direction.SEARCHING
         _directionConfidence.value = 0f
-
-        distanceSmoother.reset()
-        rssiSmoother.reset()
-        directionDetector.start()
-
-        if (isWifiTarget) {
-            startWiFiHunt()
-        } else {
-            startBluetoothHunt()
-        }
-
-        startStaleMonitor()
-        startBeepUpdater()
     }
 
     @SuppressLint("MissingPermission")
@@ -195,14 +212,16 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
             scanCallback = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     if (result.device.address.equals(targetMac, true)) {
-                        processReading(result.rssi)
+                        lastDirectRssiTime.set(System.currentTimeMillis())
+                        processReading(result.rssi, isWifi = false)
                     }
                 }
 
                 override fun onBatchScanResults(results: MutableList<ScanResult>) {
                     results.forEach {
                         if (it.device.address.equals(targetMac, true)) {
-                            processReading(it.rssi)
+                            lastDirectRssiTime.set(System.currentTimeMillis())
+                            processReading(it.rssi, isWifi = false)
                         }
                     }
                 }
@@ -234,28 +253,88 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * 300ms fallback poll against the shared UnifiedScanner's live maps.
+     * Used when the direct LOW_LATENCY callback has gone quiet (device is
+     * far / filtered out of the direct feed) but the aggregating scan still
+     * sees the target. The change-guard in [processReading] prevents the
+     * same raw reading from being double-fed into the smoothers.
+     */
+    private fun startBleFallbackPoll() {
+        bleFallbackJob?.cancel()
+        bleFallbackJob = viewModelScope.launch(Dispatchers.IO) {
+            while (isActive && isHunting.get() && !isWifiTarget) {
+                try {
+                    val now = System.currentTimeMillis()
+                    val freshDirect = now - lastDirectRssiTime.get() < 1000
+                    if (!freshDirect && unifiedScanner.isScanning.value) {
+                        unifiedScanner.getLiveRssi(targetMac, isWifi = false)
+                            ?.takeIf { it != -100 || unifiedScanner.getDevice(targetMac) != null }
+                            ?.let { processReading(it, isWifi = false) }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "BLE fallback poll error: ${e.message}")
+                }
+                delay(POLL_INTERVAL_MS)
+            }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun startWiFiHunt() {
+        wifiHuntJob?.cancel()
         wifiHuntJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive && isHunting.get()) {
+            while (isActive && isHunting.get() && isWifiTarget) {
                 try {
-                    wifiManager?.startScan()
-                    delay(500)
-                    wifiManager?.scanResults?.find {
-                        it.BSSID.equals(targetMac, true)
-                    }?.let {
-                        processReading(it.level, isWifi = true)
+                    refreshWifiCacheIfNeeded()
+
+                    val liveRssi = unifiedScanner.getLiveRssi(targetMac, isWifi = true)
+                    if (liveRssi != null) {
+                        processReading(liveRssi, isWifi = true)
+                    } else {
+                        // Fallback to the OS scan-results cache
+                        wifiManager?.scanResults
+                            ?.find { it.BSSID.equals(targetMac, true) }
+                            ?.level
+                            ?.takeIf { it != 0 }
+                            ?.let { processReading(it, isWifi = true) }
                     }
-                    delay(1000)
                 } catch (e: Exception) {
                     Log.e(TAG, "WiFi hunt error", e)
-                    delay(2000)
                 }
+                delay(POLL_INTERVAL_MS)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshWifiCacheIfNeeded() {
+        val now = System.currentTimeMillis()
+        if (now - lastWifiScanRequested.get() >= WIFI_SCAN_THROTTLE_MS) {
+            lastWifiScanRequested.set(now)
+            try {
+                wifiManager?.startScan()
+            } catch (e: Exception) {
+                Log.w(TAG, "wifi startScan error: ${e.message}")
             }
         }
     }
 
     private fun processReading(rawRssi: Int, isWifi: Boolean = false) {
+        if (rawRssi == 0) return
+
+        // Change-guard: identical raw reading observed twice within the same
+        // window (direct callback vs 300ms fallback poll) is treated as one.
+        val now = System.currentTimeMillis()
+        val fingerprint = (if (isWifi) 0L else 1L) * 1_000_000L + rawRssi
+        if (fingerprint == lastAppliedKey.get() &&
+            now - lastAppliedTime.get() < DEDUPE_WINDOW_MS
+        ) {
+            return
+        }
+        lastAppliedKey.set(fingerprint)
+        lastAppliedTime.set(now)
+
         val smoothedRssi = rssiSmoother.addReading(rawRssi)
         val rawDistance = DistanceCalculator.calculateDistance(smoothedRssi, isWifi = isWifiTarget)
         val smoothed = distanceSmoother.update(rawDistance)
@@ -366,8 +445,8 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         _isScanning.value = false
         _huntDevice.value = null
 
-        huntJob?.cancel()
         wifiHuntJob?.cancel()
+        bleFallbackJob?.cancel()
         timeoutJob?.cancel()
         beepJob?.cancel()
 

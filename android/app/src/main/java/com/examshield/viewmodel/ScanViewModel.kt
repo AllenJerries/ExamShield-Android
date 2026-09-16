@@ -18,6 +18,7 @@ import com.examshield.scanner.DeviceClassifier
 import com.examshield.scanner.NetworkMonitor
 import com.examshield.scanner.NetworkStatus
 import com.examshield.scanner.ScanStatus
+import com.examshield.scanner.ScannerProvider
 import com.examshield.scanner.UnifiedScanner
 import com.examshield.scanner.WifiScanner
 import com.examshield.utils.AlarmManager
@@ -32,6 +33,8 @@ import kotlinx.coroutines.flow.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+
+enum class DeviceCategoryFilter { ALL, BLUETOOTH, WIFI, HOTSPOT }
 
 class ScanViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -51,7 +54,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     private val db = AppDatabase.getDatabase(application)
     private val deviceRepository = DeviceRepository(db)
     private val examRepository = ExamRepository(db)
-    private val unifiedScanner = UnifiedScanner(application)
+    private val unifiedScanner = ScannerProvider.get(application)
     private val bluetoothScanner = BluetoothScanner(application)
     private val wifiScanner = WifiScanner(application)
     private val cellularScanner = CellularScanner(application)
@@ -135,6 +138,22 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
             unifiedScanner.wifiScanner.wifiDevices.collect { flow.value = it.size }
         }
         flow.asStateFlow()
+    }
+
+    private val _deviceCategoryFilter = MutableStateFlow(DeviceCategoryFilter.ALL)
+    val deviceCategoryFilter: StateFlow<DeviceCategoryFilter> = _deviceCategoryFilter.asStateFlow()
+
+    fun setDeviceCategoryFilter(filter: DeviceCategoryFilter) {
+        _deviceCategoryFilter.value = filter
+    }
+
+    fun matchesCategory(device: UnifiedDevice, filter: DeviceCategoryFilter): Boolean {
+        return when (filter) {
+            DeviceCategoryFilter.ALL -> true
+            DeviceCategoryFilter.BLUETOOTH -> device.source == DeviceSource.BLUETOOTH
+            DeviceCategoryFilter.WIFI -> device.source == DeviceSource.WIFI_NETWORK
+            DeviceCategoryFilter.HOTSPOT -> device.source == DeviceSource.WIFI_HOTSPOT
+        }
     }
 
     private val isInitialized = AtomicBoolean(false)

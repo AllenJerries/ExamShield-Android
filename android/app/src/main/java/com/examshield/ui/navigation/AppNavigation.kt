@@ -88,9 +88,11 @@ fun AppNavigation() {
                 examId = examId,
                 onHuntDevice = { mac, name, type ->
                     Log.d(TAG, "onHuntDevice callback: mac=$mac name=$name type=$type")
-                    val source = if (type.contains("WIFI") || type.contains("HOTSPOT")) {
-                        "WIFI_HOTSPOT"
-                    } else "BLUETOOTH"
+                    val source = when {
+                        type.contains("HOTSPOT") -> "WIFI_HOTSPOT"
+                        type.contains("WIFI") -> "WIFI_NETWORK"
+                        else -> "BLUETOOTH"
+                    }
                     navController.navigate(Routes.proximityHunt(mac, name, type, source))
                 },
                 onEndExam = {

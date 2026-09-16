@@ -4,7 +4,7 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BluetoothSearching
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -15,6 +15,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
+import com.examshield.data.models.DeviceSource
 import com.examshield.utils.ProximityLevel
 import com.examshield.utils.getProximityColor
 
@@ -23,6 +24,7 @@ fun DistanceMeter(
     distance: Double,
     rssi: Int,
     proximityLevel: ProximityLevel,
+    source: DeviceSource = DeviceSource.BLUETOOTH,
     modifier: Modifier = Modifier
 ) {
     val color = getProximityColor(proximityLevel)
@@ -87,7 +89,11 @@ fun DistanceMeter(
             verticalArrangement = Arrangement.Center
         ) {
             Icon(
-                imageVector = Icons.Default.BluetoothSearching,
+                imageVector = when (source) {
+                    DeviceSource.BLUETOOTH -> Icons.Default.BluetoothSearching
+                    DeviceSource.WIFI_NETWORK -> Icons.Default.Wifi
+                    DeviceSource.WIFI_HOTSPOT -> Icons.Default.WifiTethering
+                },
                 contentDescription = null,
                 tint = color,
                 modifier = Modifier.size(60.dp)

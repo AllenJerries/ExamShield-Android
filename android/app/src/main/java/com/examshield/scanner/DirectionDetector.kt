@@ -21,6 +21,18 @@ enum class Direction {
     FOUND
 }
 
+/**
+ * Combines device orientation (rotation vector + linear acceleration) with
+ * live signal-strength deltas to produce a movement-aware direction pointer.
+ *
+ * Calibration notes:
+ *  - Sample & stability thresholds are tuned so the pointer leaves SEARCHING
+ *    after ~3-5 walking steps (a handful of RSSI readings).
+ *  - When the compass heading fluctuates (large spread inside the analysis
+ *    window) the detector falls back to the last *stable* heading combined
+ *    with the smoothed RSSI gradient, so the arrow still points instead of
+ *    freezing in "SEARCHING...".
+ */
 class DirectionDetector(context: Context) : SensorEventListener {
 
     private val TAG = "DirectionDetector"
@@ -41,11 +53,26 @@ class DirectionDetector(context: Context) : SensorEventListener {
 
     private var accelMagnitude = 0f
     private var lastMovementTime = 0L
+    private var lastMovementHeading = 0f
 
-    // History with more data points
+    // Heading smoothing + stable-heading tracking (fallback source)
+    private var smoothedHeading = 0f
+    private var headingInitialized = false
+    private var lastHeadingSample = 0f
+    private var headingSampleCount = 0
+    private var lastStableHeading = -1f
+
+    // History
     private val history = mutableListOf<SignalPoint>()
-    private val maxHistorySize = 30  // Increased
-    private val minReadingsForAnalysis = 8  // Need more data
+    private val maxHistorySize = 24
+
+    // Calibrated (lower) thresholds so SEARCHING clears within a few steps
+    private val minReadingsForAnalysis = 3
+    private val minRecentReadings = 3
+    private val recentWindowMs = 8_000L
+    private val minStableDirectionCount = 3
+    private val minTrendMagnitude = 0.05
+    private val maxHeadingSpreadForTrust = 60f
 
     var directionToDevice: Direction = Direction.SEARCHING
         private set
@@ -53,9 +80,9 @@ class DirectionDetector(context: Context) : SensorEventListener {
     var confidence: Float = 0f
         private set
 
-    // Stability tracking
     private var lastDirection: Direction = Direction.SEARCHING
     private var directionStableCount = 0
+    private var usingFallback = false
 
     data class SignalPoint(
         val rssi: Int,
@@ -66,17 +93,18 @@ class DirectionDetector(context: Context) : SensorEventListener {
 
     fun start() {
         lastMovementTime = System.currentTimeMillis()
+        lastMovementHeading = 0f
         lastDirection = Direction.SEARCHING
         directionStableCount = 0
+        headingInitialized = false
+        headingSampleCount = 0
+        lastStableHeading = -1f
+        usingFallback = false
         rotationSensor?.let {
-            sensorManager.registerListener(
-                this, it, SensorManager.SENSOR_DELAY_UI
-            )
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
         accelerometer?.let {
-            sensorManager.registerListener(
-                this, it, SensorManager.SENSOR_DELAY_UI
-            )
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 
@@ -85,6 +113,7 @@ class DirectionDetector(context: Context) : SensorEventListener {
         history.clear()
         directionToDevice = Direction.SEARCHING
         confidence = 0f
+        usingFallback = false
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -97,10 +126,38 @@ class DirectionDetector(context: Context) : SensorEventListener {
                 val orientation = FloatArray(3)
                 SensorManager.getOrientation(rotationMatrix, orientation)
 
-                currentHeading = Math.toDegrees(
+                var rawHeading = Math.toDegrees(
                     orientation[0].toDouble()
                 ).toFloat()
-                if (currentHeading < 0) currentHeading += 360f
+                if (rawHeading < 0) rawHeading += 360f
+
+                if (!headingInitialized) {
+                    smoothedHeading = rawHeading
+                    lastHeadingSample = rawHeading
+                    headingInitialized = true
+                } else {
+                    var delta = rawHeading - smoothedHeading
+                    if (delta > 180f) delta -= 360f
+                    if (delta < -180f) delta += 360f
+                    smoothedHeading += delta * 0.3f
+                    if (smoothedHeading < 0f) smoothedHeading += 360f
+                    if (smoothedHeading >= 360f) smoothedHeading -= 360f
+                }
+                currentHeading = smoothedHeading
+
+                var sampleDelta = rawHeading - lastHeadingSample
+                if (sampleDelta > 180f) sampleDelta -= 360f
+                if (sampleDelta < -180f) sampleDelta += 360f
+                lastHeadingSample = rawHeading
+
+                if (abs(sampleDelta) < 2.0f) {
+                    headingSampleCount++
+                    if (headingSampleCount >= 20) {
+                        lastStableHeading = smoothedHeading
+                    }
+                } else {
+                    headingSampleCount = 0
+                }
             }
             Sensor.TYPE_LINEAR_ACCELERATION -> {
                 accelMagnitude = sqrt(
@@ -111,6 +168,7 @@ class DirectionDetector(context: Context) : SensorEventListener {
 
                 if (accelMagnitude > 0.3f) {
                     lastMovementTime = System.currentTimeMillis()
+                    lastMovementHeading = currentHeading
                 }
             }
         }
@@ -140,86 +198,85 @@ class DirectionDetector(context: Context) : SensorEventListener {
     private fun analyzeDirection() {
         val timeSinceMovement = System.currentTimeMillis() - lastMovementTime
 
-        // Check if user is moving
+        // User is stationary -> no meaningful walking vector yet
         if (timeSinceMovement > 3000) {
-            // Not moving for 3 seconds
             directionToDevice = Direction.STAY
             confidence = 0f
             return
         }
 
-        // Get recent readings (last 10 seconds)
-        val cutoff = System.currentTimeMillis() - 10000
+        val cutoff = System.currentTimeMillis() - recentWindowMs
         val recent = history.filter { it.timestamp > cutoff }
 
-        if (recent.size < 5) {
+        if (recent.size < minRecentReadings) {
             directionToDevice = Direction.SEARCHING
-            confidence = 20f
+            confidence = 15f
             return
         }
 
-        // GUARD: if the phone rotated a lot during this window, the heading
-        // (and therefore the direction label) is unreliable. Keep last known.
-        val headings = recent.map { it.heading }
-        val maxHeading = headings.max()
-        val minHeading = headings.min()
-        val headingSpread = when {
-            maxHeading - minHeading <= 180f -> maxHeading - minHeading
-            else -> 360f - (maxHeading - minHeading)
-        }
-        if (headingSpread > 60f) {
-            confidence = (confidence * 0.7f).coerceIn(0f, 100f)
-            return
-        }
-
-        // Calculate signal trend using LINEAR REGRESSION
         val trend = calculateTrend(recent)
 
-        // Get dominant heading
-        val avgHeading = recent.map { it.heading }.average().toFloat()
-        val userDirection = getHeadingDirection(avgHeading)
+        val headings = recent.map { it.heading }
+        val avgHeading = headings.average().toFloat()
+        val headingSpread = computeHeadingSpread(headings)
 
-        // Determine direction based on signal trend
-        // Higher threshold => only a strong, real signal change flips direction
-        val newDirection = when {
-            abs(trend) < 0.08 -> {
-                // No significant change - keep current direction
-                directionToDevice
-            }
-            trend > 0 -> {
-                // Signal getting stronger - device is in walk direction
-                userDirection
-            }
-            else -> {
-                // Signal getting weaker - device is opposite
-                getOppositeDirection(userDirection)
-            }
+        // 1) Choose a trustworthy heading. If the compass swung around inside
+        //    the window, fall back to the last stable heading (or the heading
+        //    captured at the last step) so the arrow still has an anchor.
+        val reliableHeading = when {
+            headingSpread <= maxHeadingSpreadForTrust -> avgHeading
+            lastStableHeading >= 0f -> lastStableHeading
+            lastMovementHeading != 0f -> lastMovementHeading
+            directionToDevice in DIRECTIONAL -> headingFromDirection(directionToDevice)
+            else -> avgHeading
+        }
+        usingFallback = headingSpread > maxHeadingSpreadForTrust
+
+        val userDirection = getHeadingDirection(reliableHeading)
+
+        val trendDirection = when {
+            abs(trend) < minTrendMagnitude -> null
+            trend > 0 -> userDirection
+            else -> getOppositeDirection(userDirection)
         }
 
-        // STABILITY CHECK - only change direction if consistent
-        if (newDirection == lastDirection) {
-            directionStableCount++
+        if (trendDirection != null) {
+            if (trendDirection == lastDirection) {
+                directionStableCount++
+            } else {
+                lastDirection = trendDirection
+                directionStableCount = 0
+            }
+
+            if (directionStableCount >= minStableDirectionCount) {
+                directionToDevice = trendDirection
+            }
+
+            val trendConfidence = abs(trend).toFloat() * 100f
+            confidence = (
+                trendConfidence + directionStableCount * 12f
+                ) * (if (usingFallback) 0.7f else 1.0f)
+                .coerceIn(5f, 100f)
         } else {
-            directionStableCount = 0
-            lastDirection = newDirection
+            // No meaningful gradient yet — hold current pointer instead of
+            // dropping back to SEARCHING once a cardinal direction is known.
+            if (directionToDevice == Direction.SEARCHING) {
+                confidence = 15f
+            } else {
+                confidence = (confidence * 0.9f).coerceAtLeast(5f)
+            }
         }
 
-        // Only update direction after 5 consistent readings
-        if (directionStableCount >= 5) {
-            directionToDevice = newDirection
-        }
-
-        // Confidence based on trend strength and stability
-        val trendConfidence = abs(trend).toFloat() * 100f
-        confidence = (trendConfidence + directionStableCount * 10f)
-            .coerceIn(0f, 100f)
-
-        Log.d(TAG, "Direction: $directionToDevice, Trend: $trend, Confidence: $confidence")
+        Log.d(
+            TAG,
+            "Direction: $directionToDevice | Trend: $trend | " +
+                "Conf: ${confidence.toInt()} | Fallback: $usingFallback"
+        )
     }
 
     /**
-     * Calculate signal trend using linear regression
-     * Returns positive if increasing, negative if decreasing
+     * Signal strength trend (linear regression over reading index).
+     * Positive => increasing signal (closer), negative => decreasing.
      */
     private fun calculateTrend(readings: List<SignalPoint>): Double {
         if (readings.size < 2) return 0.0
@@ -242,6 +299,16 @@ class DirectionDetector(context: Context) : SensorEventListener {
         return if (denominator != 0.0) numerator / denominator else 0.0
     }
 
+    private fun computeHeadingSpread(headings: List<Float>): Float {
+        if (headings.isEmpty()) return 0f
+        val maxHeading = headings.max()
+        val minHeading = headings.min()
+        return when {
+            maxHeading - minHeading <= 180f -> maxHeading - minHeading
+            else -> 360f - (maxHeading - minHeading)
+        }
+    }
+
     private fun getHeadingDirection(heading: Float): Direction {
         return when {
             heading < 45 || heading >= 315 -> Direction.FRONT
@@ -260,5 +327,24 @@ class DirectionDetector(context: Context) : SensorEventListener {
             Direction.RIGHT -> Direction.LEFT
             else -> Direction.UNKNOWN
         }
+    }
+
+    private fun headingFromDirection(dir: Direction): Float {
+        return when (dir) {
+            Direction.FRONT -> 0f
+            Direction.RIGHT -> 90f
+            Direction.BACK -> 180f
+            Direction.LEFT -> 270f
+            else -> currentHeading
+        }
+    }
+
+    companion object {
+        private val DIRECTIONAL = setOf(
+            Direction.FRONT,
+            Direction.BACK,
+            Direction.LEFT,
+            Direction.RIGHT
+        )
     }
 }
