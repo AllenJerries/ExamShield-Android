@@ -191,18 +191,46 @@ class UnifiedScanner(private val context: Context) {
                 isFromWifi = false
             )
 
-            if (!classification.shouldShow) return null
+            val isClassic = bluetoothScanner.isClassicDevice(macAddress)
+            val isFallbackNamed = name.startsWith("Bluetooth Device (") ||
+                name.startsWith("Hidden BLE Device (")
+
+            // Never drop paired/connected classic devices or devices that only
+            // got a fallback name — the whole point is to surface them.
+            if (!classification.shouldShow && !isClassic && !isFallbackNamed) return null
+
+            val deviceType = if (classification.shouldShow) {
+                classification.deviceType
+            } else if (isClassic) {
+                DeviceType.OTHER
+            } else {
+                DeviceType.UNKNOWN
+            }
+            val riskLevel = if (classification.shouldShow) {
+                classification.riskLevel
+            } else if (isClassic) {
+                RiskLevel.MEDIUM
+            } else {
+                RiskLevel.LOW
+            }
+            val description = if (classification.shouldShow) {
+                classification.description
+            } else if (isClassic) {
+                "Paired/connected Bluetooth device"
+            } else {
+                "Unnamed Bluetooth device"
+            }
 
             UnifiedDevice(
                 macAddress = macAddress,
                 name = name,
                 rssi = rssi,
                 source = DeviceSource.BLUETOOTH,
-                deviceType = classification.deviceType,
-                riskLevel = classification.riskLevel,
+                deviceType = deviceType,
+                riskLevel = riskLevel,
                 manufacturer = scanResult.manufacturer,
                 scanRecord = scanRecordBytes,
-                description = classification.description
+                description = description
             )
         } catch (e: Exception) {
             Log.e(TAG, "Convert BLE error", e)

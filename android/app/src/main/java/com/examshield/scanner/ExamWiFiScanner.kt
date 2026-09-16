@@ -241,58 +241,7 @@ class ExamWiFiScanner(private val context: Context) {
         frequency: Int,
         capabilities: String
     ): Boolean {
-        val ssidLower = ssid.lowercase()
-
-        val hotspotKeywords = listOf(
-            "androidap", "android_hotspot", "mywifi",
-            "iphone", "galaxy", "redmi",
-            "vivo", "oppo", "realme", "oneplus",
-            "poco", "mi ", "samsung", "moto",
-            "pixel", "nothing", "iqoo", "infinix",
-            "tecno", "hotspot", "phone", "mobile",
-            "personal hotspot", "portable", "tethering"
-        )
-
-        if (hotspotKeywords.any { ssidLower.contains(it) }) {
-            Log.d(TAG, "Hotspot by name: $ssid")
-            return true
-        }
-
-        if (isMobileMac(bssid)) {
-            Log.d(TAG, "Hotspot by MAC: $bssid")
-            return true
-        }
-
-        val is2_4GHz = frequency in 2412..2484
-        val isWPA2 = capabilities.contains("WPA2")
-        val hasNumberPattern = ssid.matches(Regex(".*[0-9]{4,}.*"))
-
-        if (is2_4GHz && isWPA2 && hasNumberPattern) {
-            Log.d(TAG, "Hotspot by pattern: $ssid ($frequency MHz)")
-            return true
-        }
-
-        return false
-    }
-
-    private fun isMobileMac(mac: String): Boolean {
-        if (mac.length < 8) return false
-        val oui = mac.substring(0, 8).replace(":", "").uppercase()
-
-        val mobileOUIs = listOf(
-            "F0C77F", "00265C", "D0176A", "8425DB", "34145F", "3413E8", "5C0A5B",
-            "00259C", "D89B3B", "F0DBE2", "68967B", "F41BA1", "5CF7E6",
-            "A0999B", "8C1D96", "0C1105", "50EC50", "68DFDD", "742344",
-            "94E979", "38A28C", "68D247", "A81B18", "8CBFA6",
-            "2C6E85", "9CE33F", "94652D",
-            "D46A6A", "3096FB", "80B03D",
-            "0865A9", "5C7188", "60B4F7",
-            "F4F5D8", "34E12D", "3417EB",
-            "0421B0", "0022FB", "24E314",
-            "60ABD2", "1CAFF7", "4C34B3", "F09E63"
-        )
-
-        return mobileOUIs.any { oui.startsWith(it) }
+        return HotspotDetector.isMobileHotspot(ssid, bssid, frequency, capabilities)
     }
 
     private fun emitDevices() {

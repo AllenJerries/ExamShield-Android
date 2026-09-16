@@ -18,6 +18,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.examshield.scanner.ProximityHunter
 import com.examshield.ui.theme.*
+import com.examshield.utils.formatDistanceHuman
 
 @Composable
 fun RSSIMeter(
@@ -81,7 +82,7 @@ fun RSSIMeter(
             verticalArrangement = Arrangement.Center
         ) {
             Text(
-                text = "${rssi} dBm",
+                text = formatDistanceHuman(rssi),
                 fontSize = 32.sp,
                 fontWeight = FontWeight.Bold,
                 color = statusColor

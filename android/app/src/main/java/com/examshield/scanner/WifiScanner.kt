@@ -160,6 +160,14 @@ class WifiScanner(private val context: Context) {
 
             val manufacturer = ManufacturerResolver.getManufacturer(bssid)
 
+            val isHotspot = HotspotDetector.isMobileHotspot(
+                ssid = displaySsid,
+                bssid = bssid,
+                frequency = result.frequency,
+                capabilities = result.capabilities
+            )
+            Log.d(TAG, "Classified ${if (isHotspot) "HOTSPOT" else "WiFi"}: $displaySsid")
+
             val scanResult = ScanResult(
                 macAddress = bssid,
                 deviceName = displaySsid,

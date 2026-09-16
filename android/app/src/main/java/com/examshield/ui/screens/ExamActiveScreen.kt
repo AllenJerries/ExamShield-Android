@@ -21,9 +21,12 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.examshield.data.models.*
 import com.examshield.scanner.ScanStatus
@@ -32,6 +35,7 @@ import com.examshield.ui.components.LegacyDeviceCard
 import com.examshield.ui.components.SignalInfoDialog
 import com.examshield.ui.components.DeviceTypesGuideDialog
 import com.examshield.ui.theme.*
+import com.examshield.utils.formatDistanceHuman
 import com.examshield.viewmodel.DeviceCategoryFilter
 import com.examshield.viewmodel.ScanViewModel
 
@@ -44,7 +48,9 @@ private val RELEVANT_TYPES = setOf(
     DeviceType.EARPHONE,
     DeviceType.HIDDEN_EARPIECE,
     DeviceType.MOBILE_HOTSPOT,
-    DeviceType.WIFI_DEVICE
+    DeviceType.WIFI_DEVICE,
+    DeviceType.UNKNOWN,
+    DeviceType.OTHER
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -74,6 +80,29 @@ fun ExamActiveScreen(
     var isRefreshing by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
+
+    LaunchedEffect(Unit) {
+        // Auto-start scanning as soon as the exam screen composes so the
+        // UI never shows the scanner in a "Stopped" state after the
+        // Baseline scan transitions into exam mode.
+        scanViewModel.startScanning()
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        // Restart scanning whenever the invigilator returns to this screen
+        // (e.g. back from the Proximity Hunter) so discovery keeps running.
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                Log.d(TAG, "ON_RESUME -> ensuring scanning is active")
+                scanViewModel.startScanning()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     LaunchedEffect(examId) {
         Log.d(TAG, "ExamActiveScreen launched for examId=$examId")
@@ -307,7 +336,7 @@ fun ExamActiveScreen(
                                         fontSize = 14.sp
                                     )
                                     Text(
-                                        text = "${device.description} | ${device.rssi} dBm",
+                                        text = "${device.description} \u2022 ${formatDistanceHuman(device.rssi)}",
                                         color = Color.White.copy(alpha = 0.8f),
                                         fontSize = 12.sp
                                     )

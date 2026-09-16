@@ -7,11 +7,28 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import com.examshield.data.models.DeviceType
 import com.examshield.data.models.RiskLevel
 
+/**
+ * Indoor Log-Distance Path Loss: d = 10^((TX - rssi) / (10 * n))
+ * with TX = -59 dBm @1m and path-loss exponent n = 2.2 (indoor).
+ */
 fun calculateDistanceFromRssi(rssi: Int): Double {
     if (rssi == 0 || rssi <= -100) return 999.0
-    val txPower = -59
-    val ratio = (txPower - rssi).toDouble() / 20.0
-    return Math.pow(10.0, ratio)
+    val d = Math.pow(10.0, (-59.0 - rssi) / (10.0 * 2.2))
+    return d.coerceIn(0.05, 100.0)
+}
+
+/**
+ * Converts a raw RSSI reading into a human-readable physical distance
+ * (mm / cm / m) using the indoor Log-Distance Path Loss model above.
+ */
+fun formatDistanceHuman(rssi: Int): String {
+    if (rssi == 0 || rssi <= -100) return "Unknown"
+    val d = Math.pow(10.0, (-59.0 - rssi) / (10.0 * 2.2))
+    return when {
+        d < 0.1 -> "${(d * 1000).toInt()} mm"
+        d < 1.0 -> "${(d * 100).toInt()} cm"
+        else -> String.format("%.1f m", d)
+    }
 }
 
 fun formatDistanceShort(distance: Double): String {

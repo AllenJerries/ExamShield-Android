@@ -21,6 +21,7 @@ import com.examshield.scanner.Direction
 import com.examshield.scanner.DirectionDetector
 import com.examshield.scanner.ScannerProvider
 import com.examshield.utils.AlarmManager
+import com.examshield.utils.BeepManager
 import com.examshield.utils.DistanceCalculator
 import com.examshield.utils.ProximityLevel
 import com.examshield.utils.SettingsRepository
@@ -360,20 +361,24 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun startBeepUpdater() {
         beepJob?.cancel()
+
+        // Dynamic audio beeping — cadence scales with live target RSSI
+        // (> -50 -> 90 ms, -75..-50 -> 350 ms, < -75 -> 1000 ms).
+        BeepManager.startProximityBeeping(
+            context = getApplication(),
+            getRssi = { _rssi.value },
+            volume = settingsRepo.beepVolume
+        )
+
         beepJob = viewModelScope.launch(Dispatchers.IO) {
-            Log.d(TAG, "Beep updater started")
+            Log.d(TAG, "Hunt pulse updater started")
 
             while (isActive && isHunting.get()) {
                 try {
                     val currentDist = _smoothedDistance.value
 
                     if (currentDist < 999) {
-                        Log.d(TAG, "Playing beep at ${currentDist}m")
-
-                        AlarmManager.playProximityBeep(
-                            context = getApplication(),
-                            distance = currentDist
-                        )
+                        Log.d(TAG, "Hunt pulse at ${currentDist}m")
 
                         VibrationHelper.triggerHuntPulse(
                             getApplication(),
@@ -399,12 +404,12 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    Log.e(TAG, "Beep updater error", e)
+                    Log.e(TAG, "Hunt pulse updater error", e)
                     delay(1000)
                 }
             }
 
-            Log.d(TAG, "Beep updater stopped")
+            Log.d(TAG, "Hunt pulse updater stopped")
         }
     }
 
@@ -450,6 +455,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         timeoutJob?.cancel()
         beepJob?.cancel()
 
+        BeepManager.stop()
         AlarmManager.stopAll()
 
         try {
@@ -480,6 +486,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
     override fun onCleared() {
         stopHunting()
+        BeepManager.release()
         AlarmManager.stopAll()
         vibrationHelper.stop()
         super.onCleared()

@@ -18,11 +18,12 @@ object DeviceClassifier {
         "car", "vehicle", "obd", "obdii",
         "refrigerator", "washing machine", "ac", "air conditioner",
         "microwave", "oven", "blender", "fan", "light", "bulb",
-        "thermostat", "sensor", "beacon", "tile", "airtag",
-        "kindle", "tablet", "ipad", "surface",
-        "usb", "charger", "power bank", "battery",
-        "headset", "headphone", "speaker", "earphone"
+        "thermostat", "kindle", "tablet", "ipad", "surface",
+        "usb", "charger", "power bank", "battery"
     )
+
+    // Headsets, micro earpieces, smartwatches and beacons are NOT ignored —
+    // they are the primary cheating/tracking devices this app must surface.
 
     fun classifyDeviceStrict(
         deviceName: String,

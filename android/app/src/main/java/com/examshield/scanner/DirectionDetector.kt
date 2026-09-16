@@ -48,6 +48,22 @@ class DirectionDetector(context: Context) : SensorEventListener {
         Sensor.TYPE_ROTATION_VECTOR
     )
 
+    // Raw accelerometer + magnetometer fallback heading source. Rotation
+    // vector fuses all three internally, but when it is unavailable (some
+    // devices / emulators) we reconstruct the heading the classic way.
+    private val rawAccelerometer = sensorManager.getDefaultSensor(
+        Sensor.TYPE_ACCELEROMETER
+    )
+    private val magnetometer = sensorManager.getDefaultSensor(
+        Sensor.TYPE_MAGNETIC_FIELD
+    )
+    private val gravityValues = FloatArray(3)
+    private val magneticValues = FloatArray(3)
+    private var haveGravity = false
+    private var haveMagnetic = false
+    private val MAG_LOW_PASS_ALPHA = 0.18f
+    private var fallbackHeading = 0f
+
     var currentHeading: Float = 0f
         private set
 
@@ -100,12 +116,15 @@ class DirectionDetector(context: Context) : SensorEventListener {
         headingSampleCount = 0
         lastStableHeading = -1f
         usingFallback = false
-        rotationSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-        }
-        accelerometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-        }
+        haveGravity = false
+        haveMagnetic = false
+
+        val delay = SensorManager.SENSOR_DELAY_UI
+        rotationSensor?.let { sensorManager.registerListener(this, it, delay) }
+        accelerometer?.let { sensorManager.registerListener(this, it, delay) }
+        // Fallback sensors for devices lacking TYPE_ROTATION_VECTOR.
+        rawAccelerometer?.let { sensorManager.registerListener(this, it, delay) }
+        magnetometer?.let { sensorManager.registerListener(this, it, delay) }
     }
 
     fun stop() {
@@ -131,33 +150,7 @@ class DirectionDetector(context: Context) : SensorEventListener {
                 ).toFloat()
                 if (rawHeading < 0) rawHeading += 360f
 
-                if (!headingInitialized) {
-                    smoothedHeading = rawHeading
-                    lastHeadingSample = rawHeading
-                    headingInitialized = true
-                } else {
-                    var delta = rawHeading - smoothedHeading
-                    if (delta > 180f) delta -= 360f
-                    if (delta < -180f) delta += 360f
-                    smoothedHeading += delta * 0.3f
-                    if (smoothedHeading < 0f) smoothedHeading += 360f
-                    if (smoothedHeading >= 360f) smoothedHeading -= 360f
-                }
-                currentHeading = smoothedHeading
-
-                var sampleDelta = rawHeading - lastHeadingSample
-                if (sampleDelta > 180f) sampleDelta -= 360f
-                if (sampleDelta < -180f) sampleDelta += 360f
-                lastHeadingSample = rawHeading
-
-                if (abs(sampleDelta) < 2.0f) {
-                    headingSampleCount++
-                    if (headingSampleCount >= 20) {
-                        lastStableHeading = smoothedHeading
-                    }
-                } else {
-                    headingSampleCount = 0
-                }
+                updateSmoothedHeading(rawHeading)
             }
             Sensor.TYPE_LINEAR_ACCELERATION -> {
                 accelMagnitude = sqrt(
@@ -171,6 +164,81 @@ class DirectionDetector(context: Context) : SensorEventListener {
                     lastMovementHeading = currentHeading
                 }
             }
+            Sensor.TYPE_ACCELEROMETER -> {
+                // Low-pass gravity estimate for the magnetometer fusion path.
+                for (i in 0..2) {
+                    gravityValues[i] = gravityValues[i] * MAG_LOW_PASS_ALPHA +
+                        event.values[i] * (1f - MAG_LOW_PASS_ALPHA)
+                    if (!haveGravity) gravityValues[i] = event.values[i]
+                }
+                haveGravity = true
+                computeFallbackHeading()
+            }
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                for (i in 0..2) {
+                    magneticValues[i] = magneticValues[i] * MAG_LOW_PASS_ALPHA +
+                        event.values[i] * (1f - MAG_LOW_PASS_ALPHA)
+                    if (!haveMagnetic) magneticValues[i] = event.values[i]
+                }
+                haveMagnetic = true
+                computeFallbackHeading()
+            }
+        }
+    }
+
+    private fun computeFallbackHeading() {
+        if (!haveGravity || !haveMagnetic) return
+
+        val rotationMatrix = FloatArray(9)
+        if (!SensorManager.getRotationMatrix(
+                rotationMatrix, null, gravityValues, magneticValues
+            )
+        ) return
+
+        val orientation = FloatArray(3)
+        SensorManager.getOrientation(rotationMatrix, orientation)
+
+        var rawHeading = Math.toDegrees(
+            orientation[0].toDouble()
+        ).toFloat()
+        if (rawHeading < 0) rawHeading += 360f
+
+        fallbackHeading = rawHeading
+
+        // If the fused rotation sensor is absent, use the magnetometer
+        // heading as the primary source.
+        if (rotationSensor == null) {
+            updateSmoothedHeading(rawHeading)
+        }
+    }
+
+    private fun updateSmoothedHeading(rawHeading: Float) {
+        if (!headingInitialized) {
+            smoothedHeading = rawHeading
+            lastHeadingSample = rawHeading
+            headingInitialized = true
+        } else {
+            var delta = rawHeading - smoothedHeading
+            if (delta > 180f) delta -= 360f
+            if (delta < -180f) delta += 360f
+            smoothedHeading += delta * 0.3f
+            if (smoothedHeading < 0f) smoothedHeading += 360f
+            if (smoothedHeading >= 360f) smoothedHeading -= 360f
+        }
+        currentHeading = smoothedHeading
+
+        var sampleDelta = rawHeading - lastHeadingSample
+        if (sampleDelta > 180f) sampleDelta -= 360f
+        if (sampleDelta < -180f) sampleDelta += 360f
+        lastHeadingSample = rawHeading
+
+        if (abs(sampleDelta) < 2.0f) {
+            headingSampleCount++
+            if (headingSampleCount >= 20) {
+                lastStableHeading = smoothedHeading
+            }
+        } else {
+            headingSampleCount = 0
         }
     }
 
@@ -214,7 +282,12 @@ class DirectionDetector(context: Context) : SensorEventListener {
             return
         }
 
-        val trend = calculateTrend(recent)
+        // Combine the least-squares slope with a moving-average RSSI delta so
+        // transient dips are smoothed and the gradient points the same way
+        // whether the user walks slowly (few samples) or fast (many samples).
+        val regressionTrend = calculateTrend(recent)
+        val movingTrend = movingAverageRssiDelta(recent)
+        val trend = regressionTrend * 0.5 + movingTrend * 0.5
 
         val headings = recent.map { it.heading }
         val avgHeading = headings.average().toFloat()
@@ -297,6 +370,24 @@ class DirectionDetector(context: Context) : SensorEventListener {
         }
 
         return if (denominator != 0.0) numerator / denominator else 0.0
+    }
+
+    /**
+     * Moving-average RSSI delta across the recent-reading window: average
+     * signal in the newest half minus average signal in the oldest half.
+     * Positive => signal strengthened while walking (device ahead).
+     */
+    private fun movingAverageRssiDelta(readings: List<SignalPoint>): Double {
+        if (readings.size < 2) return 0.0
+
+        val half = (readings.size / 2).coerceAtLeast(1)
+        val older = readings.take(half)
+        val newer = readings.takeLast(half)
+
+        val olderAvg = older.map { it.rssi.toDouble() }.average()
+        val newerAvg = newer.map { it.rssi.toDouble() }.average()
+
+        return newerAvg - olderAvg
     }
 
     private fun computeHeadingSpread(headings: List<Float>): Float {

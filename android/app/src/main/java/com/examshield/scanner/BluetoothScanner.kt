@@ -3,13 +3,17 @@ package com.examshield.scanner
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -41,6 +45,8 @@ class BluetoothScanner(private val context: Context) {
         private const val SCAN_RESTART_INTERVAL = 20000L
         private const val STALE_DEVICE_TIMEOUT = 10000L
         private const val CLEANUP_INTERVAL = 3000L
+        private const val CLASSIC_BONDED_REFRESH_MS = 3000L
+        private const val CLASSIC_NOMINAL_RSSI = -90
     }
 
     private val bluetoothManager = context.getSystemService(
@@ -64,6 +70,14 @@ class BluetoothScanner(private val context: Context) {
     private var restartJob: Job? = null
     private var cleanupJob: Job? = null
 
+    // Classic (BR/EDR) integration: paired/bonded devices plus classic
+    // discovery are merged into the same device map so connected TWS earbuds,
+    // AirPods, smartwatches and other paired devices surface even when they are
+    // not broadcasting BLE advertisements.
+    private val classicMacs = ConcurrentHashMap.newKeySet<String>()
+    private var classicReceiver: BroadcastReceiver? = null
+    private var bondedRefreshJob: Job? = null
+
     private val scanStartTime = AtomicLong(0)
     private val totalScansPerformed = AtomicLong(0)
     private val totalDevicesFound = AtomicLong(0)
@@ -86,6 +100,8 @@ class BluetoothScanner(private val context: Context) {
     fun getDiscoveredDevices(): Map<String, AppScanResult> {
         return deviceMap.toMap()
     }
+
+    fun isClassicDevice(mac: String): Boolean = classicMacs.contains(mac.uppercase())
 
     private fun validateEnvironment(): Boolean {
         if (bluetoothAdapter == null) {
@@ -176,6 +192,7 @@ class BluetoothScanner(private val context: Context) {
             Log.d(TAG, "BLE scan #${totalScansPerformed.get()} started")
             startRestartCycle()
             startCleanupCycle()
+            startClassicBluetoothIntegration()
         }
     }
 
@@ -189,6 +206,7 @@ class BluetoothScanner(private val context: Context) {
 
             val scanRecord = result.scanRecord
             val name = extractDeviceName(device, scanRecord)
+                .ifBlank { "Hidden BLE Device (${mac.takeLast(5)})" }
             val scanRecordBytes = scanRecord?.bytes
 
             val macMfr = ManufacturerResolver.getManufacturer(mac)
@@ -297,13 +315,144 @@ class BluetoothScanner(private val context: Context) {
             currentCallback = null
         }
 
+        stopClassicBluetoothIntegration()
+
         val duration = System.currentTimeMillis() - scanStartTime.get()
         Log.d(TAG, "Scan stats: ${duration / 1000}s | ${totalScansPerformed.get()} scans | ${totalDevicesFound.get()} devices | ${deviceMap.size} tracked")
     }
 
     fun clearDevices() {
         deviceMap.clear()
+        classicMacs.clear()
         emitDevices()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startClassicBluetoothIntegration() {
+        safeExecute("Register classic receiver") {
+            classicReceiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    when (intent.action) {
+                        BluetoothDevice.ACTION_FOUND -> {
+                            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(
+                                    BluetoothDevice.EXTRA_DEVICE,
+                                    BluetoothDevice::class.java
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                            }
+                            if (device != null) {
+                                val rssi = intent.getIntExtra(
+                                    BluetoothDevice.EXTRA_RSSI,
+                                    CLASSIC_NOMINAL_RSSI
+                                )
+                                upsertClassicDevice(device, rssi)
+                            }
+                        }
+
+                        BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                            if (isScanning.get()) {
+                                handler.postDelayed({ restartClassicDiscovery() }, 1000)
+                            }
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(classicReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(classicReceiver, filter)
+            }
+        }
+
+        restartClassicDiscovery()
+
+        bondedRefreshJob = scope.launch {
+            while (isScanning.get()) {
+                refreshBondedDevices()
+                delay(CLASSIC_BONDED_REFRESH_MS)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopClassicBluetoothIntegration() {
+        bondedRefreshJob?.cancel()
+        bondedRefreshJob = null
+        safeExecute("Unregister classic receiver") {
+            classicReceiver?.let { context.unregisterReceiver(it) }
+            classicReceiver = null
+        }
+        safeExecute("Cancel classic discovery") {
+            bluetoothAdapter?.cancelDiscovery()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun restartClassicDiscovery() {
+        safeExecute("Restart classic discovery") {
+            bluetoothAdapter?.cancelDiscovery()
+            bluetoothAdapter?.startDiscovery()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshBondedDevices() {
+        try {
+            bluetoothAdapter?.bondedDevices?.forEach { device ->
+                upsertClassicDevice(device, CLASSIC_NOMINAL_RSSI)
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot read bonded devices: ${e.message}")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun upsertClassicDevice(device: BluetoothDevice, rssi: Int) {
+        try {
+            val mac = device.address?.uppercase() ?: return
+            val deviceName = try {
+                device.name
+            } catch (e: SecurityException) {
+                null
+            } ?: ""
+            val displayName = deviceName.ifBlank {
+                "Bluetooth Device (${mac.takeLast(5)})"
+            }
+
+            classicMacs.add(mac)
+
+            val existing = deviceMap[mac]
+            val existingFresh = existing != null &&
+                System.currentTimeMillis() - existing.timestamp <= STALE_DEVICE_TIMEOUT
+            val hasNominalOnly = rssi == CLASSIC_NOMINAL_RSSI
+            val finalRssi = when {
+                existingFresh && (hasNominalOnly || rssi == 0) -> existing!!.rssi
+                rssi != 0 && rssi in -100..0 -> rssi
+                existingFresh -> existing!!.rssi
+                else -> CLASSIC_NOMINAL_RSSI
+            }
+
+            deviceMap[mac] = AppScanResult(
+                macAddress = mac,
+                deviceName = displayName,
+                rssi = finalRssi,
+                isBluetooth = true,
+                manufacturer = ManufacturerResolver.getManufacturer(mac),
+                scanRecord = existing?.scanRecord,
+                timestamp = System.currentTimeMillis()
+            )
+            emitDevices()
+        } catch (e: Exception) {
+            Log.e(TAG, "Upsert classic device error", e)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -326,7 +475,9 @@ class BluetoothScanner(private val context: Context) {
                 val device = result.device
                 val mac = device.address?.uppercase() ?: return
                 if (!discoveredLocal.containsKey(mac)) {
-                    val name = result.scanRecord?.deviceName ?: device.name ?: ""
+                    val name = (result.scanRecord?.deviceName
+                        ?: device.name ?: "")
+                        .ifBlank { "Hidden BLE Device (${mac.takeLast(5)})" }
                     val rssi = result.rssi
                     val scanRecordBytes = result.scanRecord?.bytes
                     val macMfr = ManufacturerResolver.getManufacturer(mac)
@@ -397,7 +548,11 @@ class BluetoothScanner(private val context: Context) {
                             safeExecute("Stop specific scan") { scanner.stopScan(this) }
                             val scanResult = AppScanResult(
                                 macAddress = result.device.address,
-                                deviceName = result.device.name ?: result.scanRecord?.deviceName ?: "",
+                                deviceName = (result.device.name
+                                    ?: result.scanRecord?.deviceName ?: "")
+                                    .ifBlank {
+                                        "Hidden BLE Device (${result.device.address.takeLast(5)})"
+                                    },
                                 rssi = result.rssi,
                                 isBluetooth = true,
                                 manufacturer = ManufacturerResolver.getManufacturer(result.device.address),
@@ -442,6 +597,7 @@ class BluetoothScanner(private val context: Context) {
         _scanErrors.value = null
         restartJob?.cancel()
         cleanupJob?.cancel()
+        stopClassicBluetoothIntegration()
         safeExecute("Stop scan") {
             currentCallback?.let { bleScanner?.stopScan(it) }
             currentCallback = null

@@ -501,7 +501,7 @@ private fun InfoChipsRow(
         InfoChip(
             icon = Icons.Outlined.SignalCellularAlt,
             label = "Signal",
-            value = "${getSignalStrengthText(rssi)} ($rssi dBm)",
+            value = "${formatDistanceHuman(rssi)} (${getSignalStrengthText(rssi)})",
             modifier = Modifier.weight(1f)
         )
     }

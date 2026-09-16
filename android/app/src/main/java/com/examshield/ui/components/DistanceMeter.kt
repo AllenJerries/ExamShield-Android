@@ -17,6 +17,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import com.examshield.data.models.DeviceSource
 import com.examshield.utils.ProximityLevel
+import com.examshield.utils.formatDistanceHuman
 import com.examshield.utils.getProximityColor
 
 @Composable
@@ -100,7 +101,7 @@ fun DistanceMeter(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "${rssi} dBm",
+                text = formatDistanceHuman(rssi),
                 style = MaterialTheme.typography.titleMedium,
                 color = color
             )

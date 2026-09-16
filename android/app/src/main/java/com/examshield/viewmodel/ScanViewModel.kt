@@ -15,6 +15,7 @@ import com.examshield.scanner.BluetoothScanner
 import com.examshield.scanner.CellularInfo
 import com.examshield.scanner.CellularScanner
 import com.examshield.scanner.DeviceClassifier
+import com.examshield.scanner.HotspotDetector
 import com.examshield.scanner.NetworkMonitor
 import com.examshield.scanner.NetworkStatus
 import com.examshield.scanner.ScanStatus
@@ -287,6 +288,13 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun startScanning() {
+        Log.d(TAG, "startScanning() requested")
+        unifiedScanner.startScanning()
+        cellularScanner.startScanning()
+        networkMonitor.startMonitoring()
+    }
+
     fun startExamMonitoring(
         examId: Long,
         examName: String = "Exam",
@@ -421,32 +429,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun isWifiHotspot(ssid: String, bssid: String): Boolean {
-        val ssidLower = ssid.lowercase()
-
-        val hotspotKeywords = listOf(
-            "androidap", "android_hotspot", "mywifi",
-            "iphone", "galaxy", "redmi",
-            "vivo", "oppo", "realme", "oneplus",
-            "poco", "mi ", "samsung", "moto",
-            "pixel", "nothing", "iqoo", "infinix",
-            "tecno", "hotspot", "phone", "mobile",
-            "personal hotspot", "portable", "tethering"
-        )
-
-        if (hotspotKeywords.any { ssidLower.contains(it) }) return true
-
-        if (bssid.length >= 8) {
-            val oui = bssid.substring(0, 8).replace(":", "").uppercase()
-            val mobileOUIs = listOf(
-                "F0C77F", "00265C", "D0176A", "8425DB", "34145F", "3413E8", "5C0A5B",
-                "00259C", "D89B3B", "F0DBE2", "68967B", "F41BA1", "5CF7E6",
-                "A0999B", "8C1D96", "0C1105", "50EC50", "68DFDD", "742344",
-                "94E979", "38A28C", "68D247", "A81B18", "8CBFA6"
-            )
-            if (mobileOUIs.any { oui.startsWith(it) }) return true
-        }
-
-        return false
+        return HotspotDetector.isMobileHotspot(ssid = ssid, bssid = bssid)
     }
 
     fun dismissAlert() {

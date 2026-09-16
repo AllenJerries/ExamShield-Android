@@ -27,6 +27,7 @@ import com.examshield.scanner.DeviceClassifier
 import com.examshield.ui.components.getSourceColor
 import com.examshield.utils.DeviceIcons
 import com.examshield.utils.DistanceCalculator
+import com.examshield.utils.formatDistanceHuman
 import com.examshield.viewmodel.ScanViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -342,7 +343,7 @@ private fun BaselineDeviceCard(device: ScanResult) {
                 }
 
                 Text(
-                    text = "${device.rssi} dBm \u2022 ${
+                    text = "${formatDistanceHuman(device.rssi)} \u2022 ${
                         DistanceCalculator.formatDistance(distance)
                     }",
                     style = MaterialTheme.typography.bodySmall,

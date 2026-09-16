@@ -166,7 +166,7 @@ fun DeviceCard(
                         )
                         Spacer(Modifier.width(2.dp))
                         Text(
-                            text = "${device.rssi} dBm",
+                            text = formatDistanceHuman(device.rssi),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 11.sp
@@ -375,7 +375,7 @@ fun LegacyDeviceCard(
                         )
                         Spacer(Modifier.width(2.dp))
                         Text(
-                            text = "${device.rssi} dBm",
+                            text = formatDistanceHuman(device.rssi),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
