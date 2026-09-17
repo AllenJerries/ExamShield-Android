@@ -7,57 +7,76 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import com.examshield.data.models.DeviceSource
 import com.examshield.data.models.DeviceType
 import com.examshield.data.models.RiskLevel
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 /**
- * Radio-calibrated indoor Log-Distance Path Loss model.
+ * Source-aware Log-Distance Path Loss distance engine.
  *
- *  d = 10^((A - RSSI) / (10 * n))
+ * Each radio type keeps its OWN calibrated propagation curve,
+ * d = 10^((A - RSSI) / (10 * n)):
  *
- *  Bluetooth (BLE / Classic): A = -55 dBm @1m, n = 2.0 (near-field tuned)
- *  Wi-Fi / Hotspot:          A = -45 dBm @1m, n = 2.6 (higher obstruction)
+ *  - Bluetooth / BLE / earphones:  A = -54.0 dBm, n = 1.9
+ *    (-54 dBm is the 1 m reference for a phone-side BLE receiver; n = 1.9
+ *    is a clean in-room BLE exponent that stays stable indoors.)
+ *  - Wi-Fi / Hotspot:              A = -42.0 dBm, n = 2.4
+ *    (AP TX power reference at 1 m; n = 2.4 approximates indoor multipath.)
  *
- * Near-field calibration: for BLE radios, RSSI >= -55 dBm is forced strictly
- * under 0.5 m and RSSI >= -40 dBm strictly under 0.15 m, so a device held
- * centimetres away can never read as "far away".
+ * Hard ambient noise floor: any scan at or below -82 dBm is treated as weak
+ * background RF (external / far-room interference, not a real target) and is
+ * dropped entirely — it routes back to 999 ("Unknown") so no false positive
+ * ever reaches the gauge, alerts or audio engine.
  */
-private const val BLE_TX_REFERENCE = -55.0
-private const val BLE_PATH_LOSS_EXPONENT = 2.0
-private const val WIFI_TX_REFERENCE = -45.0
-private const val WIFI_PATH_LOSS_EXPONENT = 2.6
+private const val BT_TX_REFERENCE = -54.0
+private const val BT_PATH_LOSS_EXPONENT = 1.9
+
+private const val WIFI_TX_REFERENCE = -42.0
+private const val WIFI_PATH_LOSS_EXPONENT = 2.4
+
+private const val AMBIENT_NOISE_FLOOR_DBM = -82
+
+private const val MAX_DISTANCE_METERS = 100.0
 
 fun isWifiSource(source: DeviceSource?): Boolean {
     return source == DeviceSource.WIFI_HOTSPOT || source == DeviceSource.WIFI_NETWORK
 }
 
-private fun referencePower(source: DeviceSource?): Double {
-    return if (isWifiSource(source)) WIFI_TX_REFERENCE else BLE_TX_REFERENCE
-}
-
-private fun pathLossExponent(source: DeviceSource?): Double {
-    return if (isWifiSource(source)) WIFI_PATH_LOSS_EXPONENT else BLE_PATH_LOSS_EXPONENT
+/**
+ * Hard ambient-noise gate. Returns true when the sample is missing (0) or
+ * sitting below -82 dBm — such readings are background RF, not a target.
+ */
+fun isBackgroundSignal(rssi: Int): Boolean {
+    return rssi == 0 || rssi < AMBIENT_NOISE_FLOOR_DBM
 }
 
 /**
- * Indoor Log-Distance Path Loss with radio-specific calibration:
- * distance = 10^((A - rssi) / (10 * n)).
- *
- * Near-field clamping (BLE): RSSI >= -55 dBm forces a distance strictly below
- * 0.5 m, and RSSI >= -40 dBm forces it strictly below 0.15 m, so centimetre
- * contact never displays as metres away. Wi-Fi keeps its own curve.
+ * Source-aware Log-Distance Path Loss. Bluetooth / BLE / earphones run their
+ * own A = -54 / n = 1.9 curve; Wi-Fi / Hotspots run A = -42 / n = 2.4. Every
+ * call recomputes from fresh (per-MAC median+adaptive filtered) RSSI so output
+ * never caches stale data. Crosses the -82 dBm noise floor and (999 = unknown)
+ * returns 999.0 — the device is simply not a live signal.
  */
 fun calculateDistanceFromRssi(rssi: Int, source: DeviceSource? = null): Double {
-    if (rssi == 0 || rssi <= -100) return 999.0
-    val calibrated = isWifiSource(source)
-    val d = Math.pow(
-        10.0,
-        (referencePower(source) - rssi) / (10.0 * pathLossExponent(source))
-    ).coerceIn(0.05, 100.0)
-
-    return when {
-        !calibrated && rssi >= -40 -> d.coerceAtMost(0.149) // strictly < 0.15 m
-        !calibrated && rssi >= -55 -> d.coerceAtMost(0.499) // strictly < 0.50 m
-        else -> d
+    if (isBackgroundSignal(rssi)) return 999.0
+    return if (isWifiSource(source)) {
+        wifiLogDistance(rssi)
+    } else {
+        bluetoothLogDistance(rssi)
     }
+}
+
+private fun bluetoothLogDistance(rssi: Int): Double {
+    return Math.pow(
+        10.0,
+        (BT_TX_REFERENCE - rssi) / (10.0 * BT_PATH_LOSS_EXPONENT)
+    ).coerceIn(0.05, MAX_DISTANCE_METERS)
+}
+
+private fun wifiLogDistance(rssi: Int): Double {
+    return Math.pow(
+        10.0,
+        (WIFI_TX_REFERENCE - rssi) / (10.0 * WIFI_PATH_LOSS_EXPONENT)
+    ).coerceIn(0.05, MAX_DISTANCE_METERS)
 }
 
 /**
@@ -66,9 +85,10 @@ fun calculateDistanceFromRssi(rssi: Int, source: DeviceSource? = null): Double {
  * Maps to mm (<0.1 m), cm (<1.0 m) and m (>=1.0 m). Recomputes the distance
  * from raw RSSI on every call, so rendered output tracks an RSSI change with
  * the caller's update rate (<=100ms in hunt mode) and never caches stale data.
+ * Any ambient reading below the -82 dBm noise floor renders as "Unknown".
  */
 fun formatDistanceHuman(rssi: Int, source: DeviceSource? = null): String {
-    if (rssi == 0 || rssi <= -100) return "Unknown"
+    if (isBackgroundSignal(rssi)) return "Unknown"
     val d = calculateDistanceFromRssi(rssi, source)
     return when {
         d < 0.1 -> "${(d * 1000).toInt()} mm"
@@ -89,20 +109,65 @@ fun formatDistanceShort(distance: Double): String {
 }
 
 /**
- * Asymmetric Exponential Moving Average (EMA) RSSI filter.
- *
- *  - Raw RSSI INCREASES (signal strengthens, device getting closer):
- *    the raw reading is used INSTANTLY (alpha = 1.0) — zero smoothing delay,
- *    so distance falls the moment the invigilator steps toward the target.
- *  - Raw RSSI DECREASES (device moving away): standard EMA with alpha = 0.75.
- *
- *  smoothedRssi = if (raw > prev) raw else 0.75*raw + 0.25*prev
- *
- * The symmetric delta between the two states recalibrates the estimate 1:1 on
- * approach (needed for close-range verdicts) while still damping retreat-side
- * single-sample BLE / Wi-Fi jitter on the way down.
+ * Per-MAC RSSI isolation: keeps an independent 5-sample sliding window of raw
+ * RSSI history for EVERY MAC address, so bursts of interference from one
+ * device can never bleed into the distance estimate of another. For each
+ * incoming sample the median of the last N readings is returned, stripping
+ * single-sample noise spikes before any distance / direction / audio math.
  */
-class RssiEmaSmoother(private val alpha: Double = 0.75) {
+class PerMacRssiMedian(private val windowSize: Int = 5) {
+
+    private val rssiHistory = ConcurrentHashMap<String, ArrayDeque<Int>>()
+
+    @Synchronized
+    fun medianFor(mac: String, rssi: Int): Int {
+        val deque = rssiHistory.getOrPut(mac.uppercase()) { ArrayDeque() }
+        deque.addLast(rssi)
+        while (deque.size > windowSize) {
+            deque.removeFirst()
+        }
+        val sorted = deque.sorted()
+        return if (sorted.size % 2 == 1) {
+            sorted[sorted.size / 2]
+        } else {
+            (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2
+        }
+    }
+
+    @Synchronized
+    fun removeMac(mac: String) {
+        rssiHistory.remove(mac.uppercase())
+    }
+
+    @Synchronized
+    fun clear() {
+        rssiHistory.clear()
+    }
+
+    @Synchronized
+    fun historyFor(mac: String): List<Int> {
+        return rssiHistory[mac.uppercase()]?.toList() ?: emptyList()
+    }
+}
+
+/**
+ * Adaptive Moving Average (AMA) RSSI filter.
+ *
+ *  - |ΔRSSI| > 2.0 dBm (device physically moving): alpha = 0.95 — the estimate
+ *    snaps almost entirely to the live reading for INSTANT motion response,
+ *    so the gauge / arrow / audio engine react the moment the invigilator steps
+ *    toward or away from the target.
+ *  - |ΔRSSI| <= 2.0 dBm (target holding still, multipath jitter): alpha = 0.35
+ *    — heavy static averaging strips single-sample multipath noise so the
+ *    rendered distance stays rock-steady while the user is stationary.
+ *
+ *  smoothed = if (prev == null) raw else prev + alpha * (raw - prev)
+ */
+class AdaptiveRssiSmoother(
+    private val motionAlpha: Double = 0.95,
+    private val staticAlpha: Double = 0.35,
+    private val deltaThresholdDbm: Double = 2.0
+) {
 
     private var prev: Double? = null
 
@@ -110,15 +175,14 @@ class RssiEmaSmoother(private val alpha: Double = 0.75) {
         private set
 
     fun addReading(rawRssi: Int): Int {
-        val previous = prev
-        val value = if (previous == null) {
-            rawRssi.toDouble()
-        } else if (rawRssi > previous) {
-            // Approaching: trust the live reading over any history.
-            rawRssi.toDouble()
-        } else {
-            alpha * rawRssi + (1 - alpha) * previous
-        }
+        val value = prev?.let { previous ->
+            val alpha = if (abs(rawRssi - previous) > deltaThresholdDbm) {
+                motionAlpha
+            } else {
+                staticAlpha
+            }
+            previous + alpha * (rawRssi - previous)
+        } ?: rawRssi.toDouble()
         prev = value
         smoothed = value
         return kotlin.math.round(value).toInt()

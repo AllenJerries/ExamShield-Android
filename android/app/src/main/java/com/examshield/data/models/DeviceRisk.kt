@@ -13,6 +13,7 @@ enum class DeviceType {
     SMARTWATCH,
     EARPHONE,
     HIDDEN_EARPIECE,
+    TRACKING_BEACON,
     MOBILE_HOTSPOT,
     WIFI_DEVICE,
     UNKNOWN,

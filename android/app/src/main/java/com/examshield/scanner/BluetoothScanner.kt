@@ -5,7 +5,6 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
@@ -86,6 +85,11 @@ class BluetoothScanner(private val context: Context) {
     private val classicMacs = ConcurrentHashMap.newKeySet<String>()
     private var classicReceiver: BroadcastReceiver? = null
     private var bondedRefreshJob: Job? = null
+
+    // MACs with a live RF link right now, fed by ACTION_ACL_CONNECTED /
+    // ACTION_ACL_DISCONNECTED broadcasts. This is what refreshBondedDevices
+    // uses for "device.isConnected": a bonded profile that is actually linked.
+    private val activeClassicMacs = ConcurrentHashMap.newKeySet<String>()
 
     private val scanStartTime = AtomicLong(0)
     private val totalScansPerformed = AtomicLong(0)
@@ -306,8 +310,14 @@ class BluetoothScanner(private val context: Context) {
 
     private fun cleanupStaleDevices() {
         val now = System.currentTimeMillis()
+        // Paired/connected classic devices (TWS earbuds, AirPods, smartwatches
+        // and other bonded profiles) are NEVER evicted as stale — they stay in
+        // memory for the whole hunt so a brief advertisement gap never drops a
+        // live threat off the board.
         val staleKeys = deviceMap.filter {
-            now - it.value.timestamp > STALE_DEVICE_TIMEOUT
+            val mac = it.key
+            mac in classicMacs || mac in activeClassicMacs ||
+                now - it.value.timestamp <= STALE_DEVICE_TIMEOUT
         }.keys
         if (staleKeys.isNotEmpty()) {
             staleKeys.forEach {
@@ -344,6 +354,7 @@ class BluetoothScanner(private val context: Context) {
         deviceMap.clear()
         lastEmittedRssi.clear()
         classicMacs.clear()
+        activeClassicMacs.clear()
         emitDevices()
     }
 
@@ -372,6 +383,47 @@ class BluetoothScanner(private val context: Context) {
                             }
                         }
 
+                        BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(
+                                    BluetoothDevice.EXTRA_DEVICE,
+                                    BluetoothDevice::class.java
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                            }
+                            if (device != null) {
+                                val mac = device.address?.uppercase() ?: return@onReceive
+                                activeClassicMacs.add(mac)
+                                upsertClassicDevice(device, CLASSIC_NOMINAL_RSSI)
+                            }
+                        }
+
+                        BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(
+                                    BluetoothDevice.EXTRA_DEVICE,
+                                    BluetoothDevice::class.java
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                            }
+                            if (device != null) {
+                                val mac = device.address?.uppercase() ?: return@onReceive
+                                activeClassicMacs.remove(mac)
+                                val existing = deviceMap[mac]
+                                val fresh = existing != null &&
+                                    System.currentTimeMillis() - existing.timestamp <= STALE_DEVICE_TIMEOUT
+                                if (!fresh) {
+                                    deviceMap.remove(mac)
+                                    lastEmittedRssi.remove(mac)
+                                    emitDevices()
+                                }
+                            }
+                        }
+
                         BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
                             if (isScanning.get()) {
                                 handler.postDelayed({ restartClassicDiscovery() }, 1000)
@@ -382,6 +434,8 @@ class BluetoothScanner(private val context: Context) {
             }
             val filter = IntentFilter().apply {
                 addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+                addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
                 addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -434,21 +488,7 @@ class BluetoothScanner(private val context: Context) {
                 val existingFresh = existing != null &&
                     now - existing.timestamp <= STALE_DEVICE_TIMEOUT
 
-                val isConnected = try {
-                    val connected = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        bluetoothManager?.getConnectionState(device) ==
-                            BluetoothProfile.STATE_CONNECTED
-                    } else {
-                        @Suppress("DEPRECATION")
-                        device.isConnected
-                    }
-                    connected
-                } catch (e: SecurityException) {
-                    Log.w(TAG, "Cannot check connection state for $mac: ${e.message}")
-                    false
-                } catch (e: Exception) {
-                    false
-                }
+                val isConnected = mac in activeClassicMacs
 
                 if (isConnected || existingFresh) {
                     // Active presence: either the radio is connected right now

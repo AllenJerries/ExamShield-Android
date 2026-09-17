@@ -24,8 +24,9 @@ import com.examshield.utils.AlarmManager
 import com.examshield.utils.BeepManager
 import com.examshield.utils.BeepManager.BeepProfile
 import com.examshield.utils.DistanceCalculator
+import com.examshield.utils.PerMacRssiMedian
 import com.examshield.utils.ProximityLevel
-import com.examshield.utils.RssiEmaSmoother
+import com.examshield.utils.AdaptiveRssiSmoother
 import com.examshield.utils.SettingsRepository
 import com.examshield.utils.VibrationHelper
 import com.examshield.utils.calculateDistanceFromRssi
@@ -104,7 +105,14 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private val unifiedScanner = ScannerProvider.get(application)
 
     private val distanceSmoother = DistanceCalculator.DistanceSmoother()
-    private val rssiSmoother = RssiEmaSmoother(alpha = 0.75)
+    // Adaptive Moving Average: alpha 0.95 on >2dBm motion (instant response),
+    // alpha 0.35 when static (strips multipath noise).
+    private val rssiSmoother = AdaptiveRssiSmoother()
+
+    // Per-MAC 5-sample median filter. Only the hunted MAC is ever fed into it,
+    // so crosstalk from every other nearby device never reaches the direction
+    // engine or the audio engine.
+    private val perMacMedian = PerMacRssiMedian(windowSize = 5)
 
     private val directionDetector = DirectionDetector(application)
 
@@ -151,6 +159,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         isWifiTarget = source == DeviceSource.WIFI_HOTSPOT || source == DeviceSource.WIFI_NETWORK
 
         resetHuntState()
+        perMacMedian.clear()
 
         distanceSmoother.reset()
         rssiSmoother.reset()
@@ -184,6 +193,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         isWifiTarget = target.source == DeviceSource.WIFI_HOTSPOT || target.source == DeviceSource.WIFI_NETWORK
 
         resetHuntState()
+        perMacMedian.clear()
 
         distanceSmoother.reset()
         rssiSmoother.reset()
@@ -339,6 +349,12 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     fun processReading(rawRssi: Int, isWifi: Boolean = false) {
         if (rawRssi == 0) return
 
+        // STRICT TARGET ISOLATION: only the hunted MAC's scan updates may ever
+        // reach the direction engine, distance pipeline and audio engine. Every
+        // caller upstream already matches the address against [targetMac]; this
+        // guard makes the hunt airtight even if a future caller forgets.
+        if (targetMac.isEmpty()) return
+
         // Change-guard: identical raw reading observed twice within the same
         // window (direct callback vs fallback poll) is treated as one.
         val now = System.currentTimeMillis()
@@ -351,7 +367,10 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         lastAppliedKey.set(fingerprint)
         lastAppliedTime.set(now)
 
-        val smoothedRssi = rssiSmoother.addReading(rawRssi)
+        // Per-MAC 5-sample median strips interference noise spikes BEFORE any
+        // smoothing / distance / direction / audio math (isolated per device).
+        val medianRssi = perMacMedian.medianFor(targetMac, rawRssi)
+        val smoothedRssi = rssiSmoother.addReading(medianRssi)
         val rawDistance = calculateDistanceFromRssi(
             smoothedRssi,
             source = _huntSource.value
@@ -362,20 +381,27 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
         directionDetector.addSignalReading(smoothedRssi)
 
-        // Live RSSI emissions write straight into the StateFlows from the
-        // scanner thread (StateFlow is thread-safe) — no secondary dispatcher
-        // hop — keeping the gauge, arrow and audio engine exactly in sync.
-        _rssi.value = smoothedRssi
-        _distance.value = rawDistance
-        _smoothedDistance.value = smoothed
-        _proximityLevel.value = getProximityLevel(smoothed)
-        _lastUpdate.value = System.currentTimeMillis()
-        _accuracy.value = DistanceCalculator.getAccuracyEstimate(smoothedRssi)
-        _isFound.value = smoothed < 0.5
-        _direction.value = directionDetector.directionToDevice
-        _directionConfidence.value = directionDetector.confidence
-        _audioFeedback.value = BeepManager.getBeepProfile(smoothedRssi)
-        _azimuth.value = directionDetector.currentHeading
+        // All RSSI / distance / proximity state is emitted through
+        // Dispatchers.Main.immediate: on the main thread the write happens
+        // synchronously in-place (zero hops), off-main threads it posts to the
+        // main queue — every StateFlow consumer (gauge, arrow, audio engine)
+        // receives the fresh values as fast as the frame that produced them.
+        // Using the immediate dispatcher guarantees each high-frequency scan
+        // frame lands as its own state emission — never conflated/coalesced
+        // away by a default Main dispatcher queue while the scanner races ahead.
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            _rssi.value = smoothedRssi
+            _distance.value = rawDistance
+            _smoothedDistance.value = smoothed
+            _proximityLevel.value = getProximityLevel(smoothed)
+            _lastUpdate.value = System.currentTimeMillis()
+            _accuracy.value = DistanceCalculator.getAccuracyEstimate(smoothedRssi)
+            _isFound.value = smoothed < 0.5
+            _direction.value = directionDetector.directionToDevice
+            _directionConfidence.value = directionDetector.confidence
+            _audioFeedback.value = BeepManager.getBeepProfile(smoothedRssi)
+            _azimuth.value = directionDetector.currentAzimuth
+        }
 
         Log.d(TAG, "RSSI: $smoothedRssi | Distance: ${String.format("%.2f", smoothed)}m")
     }
@@ -383,8 +409,10 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private fun startBeepUpdater() {
         beepJob?.cancel()
 
-        // Dynamic audio beeping — volume, pitch (500/1000/1600 Hz) and cadence
-        // (45/180/600 ms) are all rescaled live from the smoothed target RSSI.
+        // Dynamic audio beeping — tier-scaled volume (15% far / 45% medium /
+        // 75% close / 100% very close) and beep cadence (600/350/180/45 ms)
+        // driven strictly by the TARGET's live smoothed RSSI (median-filtered,
+        // per-MAC isolated). Non-target devices are invisible to the engine.
         BeepManager.startProximityBeeping(
             context = getApplication(),
             getRssi = { _rssi.value },
@@ -399,7 +427,9 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
                     val currentDist = _smoothedDistance.value
 
                     if (currentDist < 999) {
-                        Log.d(TAG, "Hunt pulse at ${currentDist}m")
+                        val closeness = ((3.0 - currentDist) / 2.95)
+                            .coerceIn(0.0, 1.0)
+                        Log.d(TAG, "Hunt pulse at ${currentDist}m (closeness ${String.format("%.2f", closeness)})")
 
                         VibrationHelper.triggerHuntPulse(
                             getApplication(),
@@ -412,13 +442,14 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
 
-                    val waitTime = when {
-                        currentDist < 0.5 -> 250L
-                        currentDist < 1.0 -> 400L
-                        currentDist < 2.0 -> 600L
-                        currentDist < 5.0 -> 900L
-                        currentDist < 10.0 -> 1300L
-                        else -> 2000L
+                    // Pulse rate strictly tied to the target's filtered distance:
+                    // 500ms idle -> 40ms near-contact, mirroring the audio engine.
+                    val waitTime = if (currentDist >= 999) {
+                        2000L
+                    } else {
+                        val closeness = ((3.0 - currentDist) / 2.95)
+                            .coerceIn(0.0, 1.0)
+                        500L - (460L * closeness).toLong()
                     }
 
                     delay(waitTime)
@@ -489,6 +520,8 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         directionDetector.stop()
+        perMacMedian.removeMac(targetMac)
+        targetMac = ""
     }
 
     fun markAsFound() {

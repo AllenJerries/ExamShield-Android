@@ -18,18 +18,23 @@ import kotlin.math.min
  * Dynamic proximity audio engine.
  *
  * Drives an [AudioTrack] on the ALARM usage stream (audible even with the
- * media volume down) and continuously rescales volume, tone pitch and pulse
- * interval from the target's live RSSI / physical distance:
+ * media volume down) and scales volume + cadence STRICTLY with the hunted
+ * target's live RSSI:
  *
- *  - RSSI >= -50 dBm (Very Close, < 0.3 m): Volume = 1.0f,   Pitch = 1600 Hz, every 45 ms
- *  - RSSI -51..-70 dBm (Medium, 0.3-1.5 m): Volume = 0.6f,   Pitch = 1000 Hz, every 180 ms
- *  - RSSI <  -70 dBm (Far, > 1.5 m)        : Volume = 0.2f,   Pitch = 500 Hz,  every 600 ms
+ *  - RSSI >= -50 dBm  (VERY_CLOSE) -> Volume 100%,  beep every  45 ms
+ *  - RSSI -51..-65    (CLOSE)      -> Volume  75%,  beep every 180 ms
+ *  - RSSI -66..-78    (MEDIUM)     -> Volume  45%,  beep every 350 ms
+ *  - RSSI <  -78      (FAR)        -> Volume  15%,  beep every 600 ms
  *
- * The profile is re-selected every ~30 ms tick, so volume continuously turns
- * UP as the user approaches the device and turns DOWN as distance increases,
- * and the pitch/cadence of the next beep reflects the freshest reading. If
- * the [AudioTrack] cannot be created, the engine falls back to a
- * [ToneGenerator] that still scales the beep cadence.
+ * The tier is re-evaluated on every tick (~30 ms) from the freshest smoothed
+ * RSSI. Pitch climbs 500 -> 1600 Hz in step with proximity so even with the
+ * cadence locked to a tier the tone still "rises" as the target approaches.
+ *
+ * If the [AudioTrack] cannot be created, the engine falls back to a
+ * [ToneGenerator] whose stream volume is scaled tier-by-tier (100/75/45/15%)
+ * by REBUILDING the generator every time the RSSI tier changes — ToneGenerator
+ * exposes no runtime volume setter, so a fresh instance is the only way to
+ * seek its output volume.
  */
 object BeepManager {
 
@@ -39,12 +44,31 @@ object BeepManager {
     private const val SAMPLE_RATE = 44100
     private const val DEFAULT_VOLUME = 100
 
-    // Control-loop granularity: volume + profile are re-evaluated every tick,
-    // and beeps are written as 30ms frames so audio can morph mid-beep.
+    // Control-loop granularity: the tier is re-evaluated and volume re-applied
+    // every tick so the audio morphs with the live RSSI in real time.
     private const val AUDIO_TICK_MS = 30L
     private const val BEEP_FRAMES = (BEEP_DURATION_MS / AUDIO_TICK_MS).toInt()
 
-    enum class ProximityTier { VERY_CLOSE, CLOSE, FAR }
+    // RSSI tier boundaries (dBm).
+    private const val RSSI_VERY_CLOSE = -50
+    private const val RSSI_CLOSE = -65
+    private const val RSSI_MEDIUM = -78
+
+    // Tier-locked stream gains: very close 100% / close 75% / medium 45% / far 15%.
+    private const val GAIN_VERY_CLOSE = 1.0f
+    private const val GAIN_CLOSE = 0.75f
+    private const val GAIN_MEDIUM = 0.45f
+    private const val GAIN_FAR = 0.15f
+
+    // Tier-locked beep cadences (ms).
+    private const val INTERVAL_VERY_CLOSE = 45L
+    private const val INTERVAL_CLOSE = 180L
+    private const val INTERVAL_MEDIUM = 350L
+    private const val INTERVAL_FAR = 600L
+
+    private val PITCH_LEVELS = intArrayOf(500, 800, 1200, 1600)
+
+    enum class ProximityTier { VERY_CLOSE, CLOSE, MEDIUM, FAR }
 
     data class BeepProfile(
         val tier: ProximityTier,
@@ -53,34 +77,34 @@ object BeepManager {
         val intervalMs: Long
     )
 
-    private val VERY_CLOSE_PROFILE = BeepProfile(
-        tier = ProximityTier.VERY_CLOSE,
-        volume = 1.0f,
-        pitchHz = 1600,
-        intervalMs = 45L
-    )
-
-    private val CLOSE_PROFILE = BeepProfile(
-        tier = ProximityTier.CLOSE,
-        volume = 0.6f,
-        pitchHz = 1000,
-        intervalMs = 180L
-    )
-
-    private val FAR_PROFILE = BeepProfile(
-        tier = ProximityTier.FAR,
-        volume = 0.2f,
-        pitchHz = 500,
-        intervalMs = 600L
-    )
-
-    /** Resolves the audio profile for the given (live raw) RSSI. */
-    fun getBeepProfile(rssi: Int): BeepProfile {
-        return when {
-            rssi >= -50 -> VERY_CLOSE_PROFILE
-            rssi >= -70 -> CLOSE_PROFILE
-            else -> FAR_PROFILE
+    /**
+     * RSSI-driven proximity profile. Volume (100/75/45/15%) and beep cadence
+     * (45/180/350/600 ms) are locked to the four RSSI tiers above; pitch rises
+     * with closeness so the tone climbs in step with the signal.
+     */
+    fun getBeepProfileForRssi(rssi: Int): BeepProfile {
+        val (tier, volume, intervalMs) = when {
+            rssi >= RSSI_VERY_CLOSE ->
+                Triple(ProximityTier.VERY_CLOSE, GAIN_VERY_CLOSE, INTERVAL_VERY_CLOSE)
+            rssi >= RSSI_CLOSE ->
+                Triple(ProximityTier.CLOSE, GAIN_CLOSE, INTERVAL_CLOSE)
+            rssi >= RSSI_MEDIUM ->
+                Triple(ProximityTier.MEDIUM, GAIN_MEDIUM, INTERVAL_MEDIUM)
+            else ->
+                Triple(ProximityTier.FAR, GAIN_FAR, INTERVAL_FAR)
         }
+        val pitchHz = when (tier) {
+            ProximityTier.VERY_CLOSE -> PITCH_LEVELS[3]
+            ProximityTier.CLOSE -> PITCH_LEVELS[2]
+            ProximityTier.MEDIUM -> PITCH_LEVELS[1]
+            ProximityTier.FAR -> PITCH_LEVELS[0]
+        }
+        return BeepProfile(tier, volume, pitchHz, intervalMs)
+    }
+
+    /** Compatibility wrapper: routes an RSSI straight to the tier engine. */
+    fun getBeepProfile(rssi: Int): BeepProfile {
+        return getBeepProfileForRssi(rssi)
     }
 
     fun getBeepIntervalMs(rssi: Int): Long = getBeepProfile(rssi).intervalMs
@@ -107,6 +131,10 @@ object BeepManager {
         val masterVolume = volume.coerceIn(0, 100) / 100f
 
         beepJob = scope.launch {
+            val profileFor: suspend () -> BeepProfile = {
+                getBeepProfile(safeRssi(getRssi))
+            }
+
             val track = createAudioTrack()
             if (track == null) {
                 runToneGeneratorLoop(context, getRssi, volume)
@@ -120,10 +148,10 @@ object BeepManager {
 
                 while (isActive) {
                     val rssi = safeRssi(getRssi)
-                    val profile = getBeepProfile(rssi)
+                    val profile = profileFor()
 
                     // Volume is re-applied every tick (~30ms) from the freshest
-                    // RSSI, so gain rises/drops immediately with distance.
+                    // RSSI tier, so gain rises/drops in real time with the target.
                     track.setVolume(
                         (profile.volume * masterVolume).coerceIn(0f, 1f)
                     )
@@ -132,7 +160,8 @@ object BeepManager {
                         Log.d(
                             TAG,
                             "Audio profile -> ${profile.tier} | ${profile.pitchHz}Hz | " +
-                                "${profile.volume}vol | every ${profile.intervalMs}ms (RSSI $rssi)"
+                                "${String.format("%.0f", profile.volume * 100f)}% vol | " +
+                                "every ${profile.intervalMs}ms (RSSI $rssi)"
                         )
                         lastProfile = profile
                     }
@@ -146,7 +175,7 @@ object BeepManager {
                         // profile between frames so pitch + volume morph with
                         // the live RSSI even mid-beep.
                         while (framesLeft > 0 && currentCoroutineContext().isActive) {
-                            val liveProfile = getBeepProfile(safeRssi(getRssi))
+                            val liveProfile = profileFor()
                             track.setVolume(
                                 (liveProfile.volume * masterVolume).coerceIn(0f, 1f)
                             )
@@ -162,7 +191,7 @@ object BeepManager {
                         }
 
                         // Cadence measured from beep start, so very-close bursts
-                        // (60ms) can overlap the still-playing beep into a loud
+                        // (45ms) overlap the still-playing beep into a loud
                         // continuous pulse without adding dead air.
                         nextBeepAt = beepStartedAt + profile.intervalMs
                     } else {
@@ -204,7 +233,8 @@ object BeepManager {
         getRssi: () -> Int,
         volume: Int
     ) {
-        val generator = createToneGenerator(context, volume)
+        val masterVolume = volume.coerceIn(0, 100)
+        var generator = createToneGenerator(context, masterVolume)
         if (generator == null) {
             Log.e(TAG, "No audio engine available — proximity beeps disabled")
             return
@@ -212,17 +242,45 @@ object BeepManager {
 
         try {
             var lastProfile: BeepProfile? = null
+            var lastScaledGain = -1
+
+            fun releaseAndRebuild(index: Int) {
+                releaseToneGenerator(generator)
+                generator = createToneGenerator(context, index)
+            }
+
             while (currentCoroutineContext().isActive) {
                 val rssi = safeRssi(getRssi)
                 val profile = getBeepProfile(rssi)
 
+                // ToneGenerator exposes no runtime volume setter -> rebuild the
+                // generator synchronously whenever the tier-scaled stream gain
+                // (100/75/45/15%) moves, so the ALARM stream volume scales
+                // dynamically with the incoming RSSI tier change.
+                val scaledGain =
+                    (masterVolume * profile.volume).toInt().coerceIn(1, 100)
+                if (scaledGain != lastScaledGain) {
+                    lastScaledGain = scaledGain
+                    releaseAndRebuild(scaledGain)
+                }
+                // Capture into a stable non-null local so the null-check survives the
+                // closure-rebuilt generator reference.
+                val liveGenerator = generator ?: run {
+                    Log.e(TAG, "ToneGenerator unavailable at gain $scaledGain")
+                    return
+                }
+
                 if (profile != lastProfile) {
-                    Log.d(TAG, "Tone cadence -> ${profile.intervalMs}ms (RSSI $rssi)")
+                    Log.d(
+                        TAG,
+                        "Tone cadence -> ${profile.intervalMs}ms " +
+                            "${scaledGain}% stream gain (RSSI $rssi)"
+                    )
                     lastProfile = profile
                 }
 
                 try {
-                    generator.startTone(
+                    liveGenerator.startTone(
                         ToneGenerator.TONE_PROP_BEEP2,
                         BEEP_DURATION_MS
                     )
@@ -235,12 +293,7 @@ object BeepManager {
         } catch (e: CancellationException) {
             throw e
         } finally {
-            try {
-                generator.stopTone()
-                generator.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "ToneGenerator release error: ${e.message}")
-            }
+            releaseToneGenerator(generator)
         }
     }
 
@@ -329,6 +382,16 @@ object BeepManager {
         } catch (e: Exception) {
             Log.e(TAG, "ToneGenerator fallback failed", e)
             return null
+        }
+    }
+
+    private fun releaseToneGenerator(generator: ToneGenerator?) {
+        if (generator == null) return
+        try {
+            generator.stopTone()
+            generator.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "ToneGenerator release error: ${e.message}")
         }
     }
 

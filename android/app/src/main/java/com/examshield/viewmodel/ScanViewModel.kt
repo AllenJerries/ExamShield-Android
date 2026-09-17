@@ -42,14 +42,34 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val TAG = "ScanViewModel"
 
+        // How long a threat that vanished from the RF stream stays retained.
+        private const val ACTIVE_THREAT_RETENTION_MS = 30_000L
+
         private val PRIORITY_ORDER = mapOf(
             DeviceType.HIDDEN_EARPIECE to 5,
+            DeviceType.TRACKING_BEACON to 5,
             DeviceType.MOBILE_HOTSPOT to 4,
             DeviceType.EARPHONE to 3,
             DeviceType.SMARTWATCH to 2,
             DeviceType.PHONE_IOS to 1,
             DeviceType.PHONE_ANDROID to 1,
         )
+    }
+
+    /**
+     * Numeric risk priority: risk level dominates, then explicit type priority
+     * (hidden earpieces / tracking beacons first), so CRITICAL hidden cheating
+     * tools always outrank a far-but-loud unrelated device.
+     */
+    private fun riskPriority(device: UnifiedDevice): Int {
+        val typePriority = PRIORITY_ORDER[device.deviceType] ?: 0
+        val riskBonus = when (device.riskLevel) {
+            RiskLevel.CRITICAL -> 1000
+            RiskLevel.HIGH -> 600
+            RiskLevel.MEDIUM -> 300
+            RiskLevel.LOW -> 0
+        }
+        return riskBonus + typePriority * 10
     }
 
     /**
@@ -62,14 +82,15 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Dynamic output ordering: high-risk active threats first, then by
-     * ascending calculated distance so the closest cheating device is always
-     * rendered at the very top of the list.
+     * Dynamic output ordering: risk priority FIRST, then ascending estimated
+     * distance, then stronger RSSI — the closest, highest-priority cheating
+     * device is always rendered at the very top of the list.
      */
     private fun sortForDisplay(devices: List<UnifiedDevice>): List<UnifiedDevice> {
         return devices.sortedWith(
-            compareByDescending<UnifiedDevice> { isHighRiskDevice(it) }
+            compareByDescending<UnifiedDevice> { riskPriority(it) }
                 .thenBy { it.estimatedDistance }
+                .thenByDescending { it.rssi }
         )
     }
 
@@ -135,6 +156,15 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _sortedUnauthorizedDevices = MutableStateFlow<List<UnifiedDevice>>(emptyList())
     val sortedUnauthorizedDevices: StateFlow<List<UnifiedDevice>> = _sortedUnauthorizedDevices.asStateFlow()
+
+    // In-memory retention of every active threat (BLE advertisements, paired /
+    // connected classic Bluetooth, TWS earphones, AirPods, smartwatches and
+    // Wi-Fi hotspots). Feeders only refresh the flow when the RF layer changes,
+    // so this map keeps a live threat on the board even if a scanner emission
+    // skips it for one poll cycle.
+    private val _activeThreats = MutableStateFlow<List<UnifiedDevice>>(emptyList())
+    val activeThreats: StateFlow<List<UnifiedDevice>> = _activeThreats.asStateFlow()
+    private val activeThreatsMap = ConcurrentHashMap<String, UnifiedDevice>()
 
     private val _criticalAlertDevice = MutableStateFlow<UnifiedDevice?>(null)
     val criticalAlertDevice: StateFlow<UnifiedDevice?> = _criticalAlertDevice.asStateFlow()
@@ -386,6 +416,21 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         _sortedUnauthorizedDevices.value = sortForDisplay(trulyUnauthorized)
         _lastScanTime.value = System.currentTimeMillis()
 
+        // Retain every active threat in memory keyed by MAC. Threats seen on
+        // this emission refresh their lastSeen; anything that has gone silent
+        // beyond the retention window is pruned so the set stays hot but bounded.
+        val now = System.currentTimeMillis()
+        trulyUnauthorized.forEach { device ->
+            activeThreatsMap[device.macAddress.uppercase()] = device.copy(
+                lastSeen = now
+            )
+        }
+        val staleThreatKeys = activeThreatsMap.filter {
+            now - it.value.lastSeen > ACTIVE_THREAT_RETENTION_MS
+        }.keys
+        staleThreatKeys.forEach(activeThreatsMap::remove)
+        _activeThreats.value = sortForDisplay(activeThreatsMap.values.toList())
+
         checkForAlerts(trulyUnauthorized)
         autoSaveIncidents(trulyUnauthorized)
     }
@@ -522,6 +567,8 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         vibrationManager.stopVibration()
         allDetectedDevices.clear()
         whitelistMacs.clear()
+        activeThreatsMap.clear()
+        _activeThreats.value = emptyList()
         currentExamId.set(-1L)
         historyExamId.set(-1L)
     }
