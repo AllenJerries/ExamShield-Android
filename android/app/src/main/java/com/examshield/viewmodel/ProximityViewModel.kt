@@ -384,8 +384,11 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         // All RSSI / distance / proximity state is emitted through
         // Dispatchers.Main.immediate: on the main thread the write happens
         // synchronously in-place (zero hops), off-main threads it posts to the
-        // main queue — every StateFlow consumer (gauge, arrow, audio engine)
-        // receives the fresh values as fast as the frame that produced them.
+        // main queue — every StateFlow consumer (gauge, arrow, audio engine,
+        // haptics) receives the fresh values as fast as the frame that produced
+        // them. Target RSSI, dynamic audio volume AND haptic pulse rate fire
+        // together here (BeepManager.updateProximity is fully synchronous), so
+        // the audio + haptic engine reacts in the same frame as the gauge.
         // Using the immediate dispatcher guarantees each high-frequency scan
         // frame lands as its own state emission — never conflated/coalesced
         // away by a default Main dispatcher queue while the scanner races ahead.
@@ -399,7 +402,11 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
             _isFound.value = smoothed < 0.5
             _direction.value = directionDetector.directionToDevice
             _directionConfidence.value = directionDetector.confidence
+
+            // Synchronous haptic + volume scaling from the same frame's RSSI.
+            BeepManager.updateProximity(smoothedRssi)
             _audioFeedback.value = BeepManager.getBeepProfile(smoothedRssi)
+
             _azimuth.value = directionDetector.currentAzimuth
         }
 
@@ -409,10 +416,12 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private fun startBeepUpdater() {
         beepJob?.cancel()
 
-        // Dynamic audio beeping — tier-scaled volume (15% far / 45% medium /
-        // 75% close / 100% very close) and beep cadence (600/350/180/45 ms)
-        // driven strictly by the TARGET's live smoothed RSSI (median-filtered,
-        // per-MAC isolated). Non-target devices are invisible to the engine.
+        // Dynamic audio + haptic beeping — tier-scaled to the target's live smoothed
+        // RSSI (100% very close / 65% medium / 15% far; beep cadence
+        // 45/250/600 ms; heavy haptic pulses < 50 cm, light pulses every 250 ms
+        // at medium, sound-only when far). Driven strictly by the TARGET's live
+        // smoothed RSSI (median-filtered, per-MAC isolated) — non-target
+        // devices are invisible to the engine.
         BeepManager.startProximityBeeping(
             context = getApplication(),
             getRssi = { _rssi.value },
@@ -479,6 +488,8 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
                     _isFound.value = false
                     _accuracy.value = 0.0
                     _audioFeedback.value = BeepManager.getBeepProfile(-100)
+                    // Stale target: force far-tier audio + zero haptics.
+                    BeepManager.updateProximity(-100)
                     _azimuth.value = 0f
                 }
             }
@@ -509,7 +520,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         timeoutJob?.cancel()
         beepJob?.cancel()
 
-        BeepManager.stop()
+        BeepManager.stopBeeping()
         AlarmManager.stopAll()
 
         try {

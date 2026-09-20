@@ -7,6 +7,8 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.ToneGenerator
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Log
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
@@ -15,26 +17,26 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Dynamic proximity audio engine.
- *
- * Drives an [AudioTrack] on the ALARM usage stream (audible even with the
- * media volume down) and scales volume + cadence STRICTLY with the hunted
+ * Dynamic proximity engine: AUDIO + HAPTICS, both driven strictly by the hunted
  * target's live RSSI:
  *
- *  - RSSI >= -50 dBm  (VERY_CLOSE) -> Volume 100%,  beep every  45 ms
- *  - RSSI -51..-65    (CLOSE)      -> Volume  75%,  beep every 180 ms
- *  - RSSI -66..-78    (MEDIUM)     -> Volume  45%,  beep every 350 ms
- *  - RSSI <  -78      (FAR)        -> Volume  15%,  beep every 600 ms
+ *  - RSSI >= -50 dBm  (VERY_CLOSE, <20cm) -> heavy repeating haptic pulses
+ *    (`VibrationEffect.createOneShot(50, DEFAULT_AMPLITUDE)`), max 100% beep
+ *    volume, beep every 45 ms.
+ *  - RSSI -51..-68    (MEDIUM)             -> light subtle haptic pulses every
+ *    250 ms, 65% beep volume, beep every 250 ms.
+ *  - RSSI <  -68      (FAR)                -> sound only, ZERO vibration.
  *
- * The tier is re-evaluated on every tick (~30 ms) from the freshest smoothed
- * RSSI. Pitch climbs 500 -> 1600 Hz in step with proximity so even with the
- * cadence locked to a tier the tone still "rises" as the target approaches.
+ * Audio plays through an [AudioTrack] on the ALARM usage stream (audible even
+ * with the media volume down) and volume + cadence scale strictly with the
+ * RSSI tier. When the [AudioTrack] cannot be created the engine falls back to
+ * a [ToneGenerator] whose stream gain is re-scaled tier-by-tier by rebuilding
+ * the generator — ToneGenerator exposes no runtime volume setter.
  *
- * If the [AudioTrack] cannot be created, the engine falls back to a
- * [ToneGenerator] whose stream volume is scaled tier-by-tier (100/75/45/15%)
- * by REBUILDING the generator every time the RSSI tier changes — ToneGenerator
- * exposes no runtime volume setter, so a fresh instance is the only way to
- * seek its output volume.
+ * [updateProximity] is the single synchronous entry point that applies the
+ * tier gain to the live track AND (re)arms the haptic schedule on every RSSI
+ * frame, so callers on Dispatchers.Main.immediate get zero-lag audio & haptic
+ * feedback. Vibration is cancelled automatically by [stopBeeping].
  */
 object BeepManager {
 
@@ -51,20 +53,26 @@ object BeepManager {
 
     // RSSI tier boundaries (dBm).
     private const val RSSI_VERY_CLOSE = -50
-    private const val RSSI_CLOSE = -65
-    private const val RSSI_MEDIUM = -78
+    private const val RSSI_MEDIUM = -68
 
-    // Tier-locked stream gains: very close 100% / close 75% / medium 45% / far 15%.
+    // Tier-locked stream gains: very close 100% / medium 65% / far 15%.
     private const val GAIN_VERY_CLOSE = 1.0f
-    private const val GAIN_CLOSE = 0.75f
-    private const val GAIN_MEDIUM = 0.45f
+    private const val GAIN_MEDIUM = 0.65f
     private const val GAIN_FAR = 0.15f
 
     // Tier-locked beep cadences (ms).
     private const val INTERVAL_VERY_CLOSE = 45L
-    private const val INTERVAL_CLOSE = 180L
-    private const val INTERVAL_MEDIUM = 350L
+    private const val INTERVAL_MEDIUM = 250L
     private const val INTERVAL_FAR = 600L
+
+    // Haptic schedules: heavy repeating pulses when very close, light subtle
+    // pulses every 250 ms at medium, silence (sound only) when far.
+    private const val HAPTIC_VERY_CLOSE_MS = 50L
+    private const val HAPTIC_VERY_CLOSE_AMPLITUDE = VibrationEffect.DEFAULT_AMPLITUDE
+    private const val HAPTIC_VERY_CLOSE_INTERVAL_MS = 100L
+    private const val HAPTIC_MEDIUM_MS = 30L
+    private const val HAPTIC_MEDIUM_AMPLITUDE = 60
+    private const val HAPTIC_MEDIUM_INTERVAL_MS = 250L
 
     private val PITCH_LEVELS = intArrayOf(500, 800, 1200, 1600)
 
@@ -78,16 +86,14 @@ object BeepManager {
     )
 
     /**
-     * RSSI-driven proximity profile. Volume (100/75/45/15%) and beep cadence
-     * (45/180/350/600 ms) are locked to the four RSSI tiers above; pitch rises
+     * RSSI-driven proximity profile. Volume (100/65/15%) and beep cadence
+     * (45/250/600 ms) are locked to the three RSSI tiers above; pitch rises
      * with closeness so the tone climbs in step with the signal.
      */
     fun getBeepProfileForRssi(rssi: Int): BeepProfile {
         val (tier, volume, intervalMs) = when {
             rssi >= RSSI_VERY_CLOSE ->
                 Triple(ProximityTier.VERY_CLOSE, GAIN_VERY_CLOSE, INTERVAL_VERY_CLOSE)
-            rssi >= RSSI_CLOSE ->
-                Triple(ProximityTier.CLOSE, GAIN_CLOSE, INTERVAL_CLOSE)
             rssi >= RSSI_MEDIUM ->
                 Triple(ProximityTier.MEDIUM, GAIN_MEDIUM, INTERVAL_MEDIUM)
             else ->
@@ -111,13 +117,43 @@ object BeepManager {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    private var beepJob: Job? = null
+    // Audio state — read/written from the beep coroutine (Default) and
+    // synchronously from updateProximity on the caller's dispatcher, hence
+    // @Volatile.
+    @Volatile private var beepJob: Job? = null
+    @Volatile private var activeTrack: AudioTrack? = null
+    @Volatile private var currentProfile: BeepProfile? = null
+    @Volatile private var masterVolumeFloat = DEFAULT_VOLUME / 100f
+
+    // Haptic state.
+    @Volatile private var vibrator: Vibrator? = null
+    @Volatile private var hapticJob: Job? = null
+    @Volatile private var currentHapticTier: ProximityTier? = null
+
     private val pcmCache = mutableMapOf<Int, ByteArray>()
 
     /**
-     * Starts a continuous, dynamically-scaling beep loop. Call [stop] to end it.
+     * Synchronous per-frame proximity driver. Applies the tier gain to the
+     * live [AudioTrack] (or the ToneGenerator rebuild reads [currentProfile]),
+     * and (re)arms the haptic schedule for the current tier. Safe to call on
+     * any dispatcher; runs entirely in the caller's thread so Main.immediate
+     * callers get zero-lag feedback.
+     */
+    fun updateProximity(rssi: Int) {
+        val profile = getBeepProfileForRssi(rssi)
+        currentProfile = profile
+        activeTrack?.setVolume(
+            (profile.volume * masterVolumeFloat).coerceIn(0f, 1f)
+        )
+        updateHaptics(profile.tier)
+    }
+
+    /**
+     * Starts a continuous, dynamically-scaling beep + haptic loop. Call
+     * [stopBeeping] to end it.
      *
-     * @param context used to route audio onto the alarm stream
+     * @param context used to route audio onto the alarm stream and to obtain
+     *                the system [Vibrator] service
      * @param getRssi invoked every tick for the freshest smoothed RSSI
      * @param volume  invigilator master volume 0..100 (scales the tier gain)
      */
@@ -126,13 +162,16 @@ object BeepManager {
         getRssi: () -> Int,
         volume: Int = DEFAULT_VOLUME
     ) {
-        stop()
+        stopBeeping()
 
-        val masterVolume = volume.coerceIn(0, 100) / 100f
+        masterVolumeFloat = volume.coerceIn(0, 100) / 100f
+        vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
 
         beepJob = scope.launch {
             val profileFor: suspend () -> BeepProfile = {
-                getBeepProfile(safeRssi(getRssi))
+                val rssi = safeRssi(getRssi)
+                updateProximity(rssi)
+                currentProfile ?: getBeepProfile(rssi)
             }
 
             val track = createAudioTrack()
@@ -140,6 +179,7 @@ object BeepManager {
                 runToneGeneratorLoop(context, getRssi, volume)
                 return@launch
             }
+            activeTrack = track
 
             try {
                 track.play()
@@ -150,12 +190,9 @@ object BeepManager {
                     val rssi = safeRssi(getRssi)
                     val profile = profileFor()
 
-                    // Volume is re-applied every tick (~30ms) from the freshest
-                    // RSSI tier, so gain rises/drops in real time with the target.
-                    track.setVolume(
-                        (profile.volume * masterVolume).coerceIn(0f, 1f)
-                    )
-
+                    // Volume + haptics are re-applied by updateProximity every
+                    // tick (~30ms) so gain and pulse rate move with the live
+                    // RSSI in real time, on the caller's dispatcher.
                     if (profile != lastProfile) {
                         Log.d(
                             TAG,
@@ -177,7 +214,7 @@ object BeepManager {
                         while (framesLeft > 0 && currentCoroutineContext().isActive) {
                             val liveProfile = profileFor()
                             track.setVolume(
-                                (liveProfile.volume * masterVolume).coerceIn(0f, 1f)
+                                (liveProfile.volume * masterVolumeFloat).coerceIn(0f, 1f)
                             )
                             val chunk = pcmFor(liveProfile.pitchHz)
                             val offset =
@@ -204,28 +241,101 @@ object BeepManager {
                 Log.e(TAG, "Proximity beep loop error", e)
             } finally {
                 safeReleaseTrack(track)
+                activeTrack = null
             }
         }
 
         Log.d(TAG, "Proximity beeping started")
     }
 
-    fun stop() {
+    /** Stops audio AND cancels any active vibration. */
+    fun stopBeeping() {
         beepJob?.cancel()
         beepJob = null
-        Log.d(TAG, "Proximity beeping stopped")
+        activeTrack = null
+        currentProfile = null
+        cancelHaptics()
+        Log.d(TAG, "Proximity beeping + haptics stopped")
+    }
+
+    /** Alias kept for callers that still reference [stop]. */
+    fun stop() {
+        stopBeeping()
     }
 
     fun isBeeping(): Boolean = beepJob?.isActive == true
 
     /**
-     * Tears down the beep engine. Only call once (e.g. ViewModel
+     * Tears down the beep/haptic engine. Only call once (e.g. ViewModel
      * [androidx.lifecycle.ViewModel.onCleared]); the object is then unusable.
      */
     fun release() {
-        stop()
+        stopBeeping()
         scope.cancel()
         pcmCache.clear()
+        vibrator = null
+    }
+
+    private fun updateHaptics(tier: ProximityTier) {
+        val vib = vibrator
+        if (vib == null || !vib.hasVibrator()) {
+            cancelHaptics()
+            return
+        }
+        when (tier) {
+            ProximityTier.VERY_CLOSE -> {
+                if (currentHapticTier != ProximityTier.VERY_CLOSE) {
+                    currentHapticTier = ProximityTier.VERY_CLOSE
+                    startHapticPulse(
+                        vibrator = vib,
+                        durationMs = HAPTIC_VERY_CLOSE_MS,
+                        amplitude = HAPTIC_VERY_CLOSE_AMPLITUDE,
+                        intervalMs = HAPTIC_VERY_CLOSE_INTERVAL_MS
+                    )
+                }
+            }
+            ProximityTier.MEDIUM -> {
+                if (currentHapticTier != ProximityTier.MEDIUM) {
+                    currentHapticTier = ProximityTier.MEDIUM
+                    startHapticPulse(
+                        vibrator = vib,
+                        durationMs = HAPTIC_MEDIUM_MS,
+                        amplitude = HAPTIC_MEDIUM_AMPLITUDE,
+                        intervalMs = HAPTIC_MEDIUM_INTERVAL_MS
+                    )
+                }
+            }
+            ProximityTier.CLOSE, ProximityTier.FAR -> cancelHaptics()
+        }
+    }
+
+    /** Repeating haptic pulse schedule for the active tier. Re-armed on tier change only. */
+    private fun startHapticPulse(
+        vibrator: Vibrator,
+        durationMs: Long,
+        amplitude: Int,
+        intervalMs: Long
+    ) {
+        hapticJob?.cancel()
+        hapticJob = scope.launch {
+            while (isActive) {
+                try {
+                    vibrator.vibrate(
+                        VibrationEffect.createOneShot(durationMs, amplitude)
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Haptic pulse error: ${e.message}")
+                }
+                delay(intervalMs)
+            }
+        }
+    }
+
+    private fun cancelHaptics() {
+        currentHapticTier = null
+        hapticJob?.cancel()
+        hapticJob = null
+        vibrator?.cancel()
     }
 
     private suspend fun runToneGeneratorLoop(
@@ -233,8 +343,8 @@ object BeepManager {
         getRssi: () -> Int,
         volume: Int
     ) {
-        val masterVolume = volume.coerceIn(0, 100)
-        var generator = createToneGenerator(context, masterVolume)
+        val master = volume.coerceIn(0, 100)
+        var generator = createToneGenerator(context, master)
         if (generator == null) {
             Log.e(TAG, "No audio engine available — proximity beeps disabled")
             return
@@ -251,14 +361,15 @@ object BeepManager {
 
             while (currentCoroutineContext().isActive) {
                 val rssi = safeRssi(getRssi)
-                val profile = getBeepProfile(rssi)
+                updateProximity(rssi)
+                val profile = currentProfile ?: getBeepProfile(rssi)
 
                 // ToneGenerator exposes no runtime volume setter -> rebuild the
                 // generator synchronously whenever the tier-scaled stream gain
-                // (100/75/45/15%) moves, so the ALARM stream volume scales
+                // (100/65/15%) moves, so the ALARM stream volume scales
                 // dynamically with the incoming RSSI tier change.
                 val scaledGain =
-                    (masterVolume * profile.volume).toInt().coerceIn(1, 100)
+                    (master * profile.volume).toInt().coerceIn(1, 100)
                 if (scaledGain != lastScaledGain) {
                     lastScaledGain = scaledGain
                     releaseAndRebuild(scaledGain)

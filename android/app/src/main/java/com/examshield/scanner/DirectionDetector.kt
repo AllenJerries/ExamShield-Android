@@ -73,6 +73,10 @@ class DirectionDetector(context: Context) : SensorEventListener {
     private val RSSI_RISE_TO_LOCK = 1.2f   // dBm gain while walking -> lock forward
     private val RSSI_DROP_TO_UNLOCK = 4.0f // dBm drop while walking -> steer to peak
 
+    // Compass hysteresis: the raw azimuth must move at least 4 degrees before
+    // the needle follows, locking it solid and killing micro-hand-shake jitter.
+    private val MIN_AZIMUTH_DELTA = 4.0f
+
     var currentHeading: Float = 0f
         private set
 
@@ -182,8 +186,12 @@ class DirectionDetector(context: Context) : SensorEventListener {
                 SensorManager.getOrientation(rotationMatrix, orientation)
                 var rawHeading = Math.toDegrees(orientation[0].toDouble()).toFloat()
                 if (rawHeading < 0) rawHeading += 360f
-                // Instant, per-frame azimuth update — no lag, no smoothing.
-                currentAzimuth = rawHeading
+                // Compass hysteresis: only move the needle when the raw azimuth
+                // actually moved past MIN_AZIMUTH_DELTA degrees, locking it solid
+                // against micro-hand-shake jitter while staying zero-lag on real turns.
+                if (abs(angleDelta(currentAzimuth, rawHeading)) > MIN_AZIMUTH_DELTA) {
+                    currentAzimuth = rawHeading
+                }
                 updateSmoothedHeading(rawHeading)
             }
             Sensor.TYPE_ACCELEROMETER -> {
@@ -235,6 +243,14 @@ class DirectionDetector(context: Context) : SensorEventListener {
         if (rotationSensor == null) {
             updateSmoothedHeading(rawHeading)
         }
+    }
+
+    /** Signed shortest rotation [from] -> [to] in degrees, wrapped to (-180, 180]. */
+    private fun angleDelta(from: Float, to: Float): Float {
+        var delta = (to - from) % 360f
+        if (delta > 180f) delta -= 360f
+        if (delta <= -180f) delta += 360f
+        return delta
     }
 
     private fun updateSmoothedHeading(rawHeading: Float) {
