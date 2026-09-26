@@ -42,8 +42,10 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val TAG = "ScanViewModel"
 
-        // How long a threat that vanished from the RF stream stays retained.
-        private const val ACTIVE_THREAT_RETENTION_MS = 30_000L
+        // How long a threat that vanished from the RF stream stays retained. Kept at
+        // 3s to mirror the scanner's live-eviction window so every displayed
+        // device is a currently-present threat (100% live list, no ghosts).
+        private const val ACTIVE_THREAT_RETENTION_MS = 3_000L
 
         private val PRIORITY_ORDER = mapOf(
             DeviceType.HIDDEN_EARPIECE to 5,

@@ -30,6 +30,8 @@ import com.examshield.utils.AdaptiveRssiSmoother
 import com.examshield.utils.SettingsRepository
 import com.examshield.utils.VibrationHelper
 import com.examshield.utils.calculateDistanceFromRssi
+import com.examshield.utils.resetForNewHunt
+import com.examshield.utils.smoothRssiFastPath
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -106,7 +108,7 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val distanceSmoother = DistanceCalculator.DistanceSmoother()
     // Adaptive Moving Average: alpha 0.95 on >2dBm motion (instant response),
-    // alpha 0.35 when static (strips multipath noise).
+    // alpha 0.40 when static (strips multipath noise).
     private val rssiSmoother = AdaptiveRssiSmoother()
 
     // Per-MAC 5-sample median filter. Only the hunted MAC is ever fed into it,
@@ -160,6 +162,10 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
         resetHuntState()
         perMacMedian.clear()
+        // Flush the shared per-target caches (fast-path smoothing, last target
+        // MAC) so a new hunt always starts from a clean slate — stale cached
+        // numbers can never stall or freeze the live distance readout.
+        resetForNewHunt()
 
         distanceSmoother.reset()
         rssiSmoother.reset()
@@ -194,6 +200,10 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
 
         resetHuntState()
         perMacMedian.clear()
+        // Flush the shared per-target caches (fast-path smoothing, last target
+        // MAC) so a new hunt always starts from a clean slate — stale cached
+        // numbers can never stall or freeze the live distance readout.
+        resetForNewHunt()
 
         distanceSmoother.reset()
         rssiSmoother.reset()
@@ -370,7 +380,11 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
         // Per-MAC 5-sample median strips interference noise spikes BEFORE any
         // smoothing / distance / direction / audio math (isolated per device).
         val medianRssi = perMacMedian.medianFor(targetMac, rawRssi)
-        val smoothedRssi = rssiSmoother.addReading(medianRssi)
+        // Fast-path dynamic EMA (0.8*raw + 0.2*prev), keyed by target MAC, so
+        // the reading keeps sweeping with the live signal — distance never
+        // stalls or freezes, even when the direct and fallback feeds alternate.
+        val fastRssi = smoothRssiFastPath(targetMac, medianRssi)
+        val smoothedRssi = rssiSmoother.addReading(fastRssi)
         val rawDistance = calculateDistanceFromRssi(
             smoothedRssi,
             source = _huntSource.value
@@ -416,17 +430,12 @@ class ProximityViewModel(application: Application) : AndroidViewModel(applicatio
     private fun startBeepUpdater() {
         beepJob?.cancel()
 
-        // Dynamic audio + haptic beeping — tier-scaled to the target's live smoothed
-        // RSSI (100% very close / 65% medium / 15% far; beep cadence
-        // 45/250/600 ms; heavy haptic pulses < 50 cm, light pulses every 250 ms
-        // at medium, sound-only when far). Driven strictly by the TARGET's live
-        // smoothed RSSI (median-filtered, per-MAC isolated) — non-target
-        // devices are invisible to the engine.
-        BeepManager.startProximityBeeping(
-            context = getApplication(),
-            getRssi = { _rssi.value },
-            volume = settingsRepo.beepVolume
-        )
+        // Re-arm the audio engine bound to this hunt's lifecycle scope. The freshest
+        // target RSSI is injected via updateProximity from the Main.immediate
+        // emission below, so cadence (60/180/350/600 ms) and stream volume
+        // (100/75/45/15%) re-tune continuously with the live signal. The loop
+        // dies with viewModelScope and stopBeeping releases the native audio.
+        BeepManager.startBeeping(viewModelScope)
 
         beepJob = viewModelScope.launch(Dispatchers.IO) {
             Log.d(TAG, "Hunt pulse updater started")

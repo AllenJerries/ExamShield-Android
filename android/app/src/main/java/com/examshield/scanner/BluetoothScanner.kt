@@ -219,7 +219,7 @@ class BluetoothScanner(private val context: Context) {
 
             val scanRecord = result.scanRecord
             val name = extractDeviceName(device, scanRecord)
-                .ifBlank { "Hidden BLE Device (${mac.takeLast(5)})" }
+                .ifBlank { "Ready-to-Pair BT (${mac.takeLast(5)})" }
             val scanRecordBytes = scanRecord?.bytes
 
             val macMfr = ManufacturerResolver.getManufacturer(mac)
@@ -519,7 +519,7 @@ class BluetoothScanner(private val context: Context) {
                 null
             } ?: ""
             val displayName = deviceName.ifBlank {
-                "Bluetooth Device (${mac.takeLast(5)})"
+                "Ready-to-Pair BT (${mac.takeLast(5)})"
             }
 
             classicMacs.add(mac)

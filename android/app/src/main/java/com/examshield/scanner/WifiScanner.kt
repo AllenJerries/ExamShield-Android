@@ -28,7 +28,12 @@ class WifiScanner(private val context: Context) {
 
     companion object {
         private const val TAG = "WifiScanner"
+        // Minimum spacing between explicit wifiManager.startScan() calls —
+        // Android throttles active scans, so requests are spaced out...
         private const val WIFI_SCAN_INTERVAL_MS = 30_000L
+        // ...while the CACHED scanResults are re-polled continuously every 2s,
+        // so a finished scan (or throttled request) is reflected instantly.
+        private const val WIFI_POLL_INTERVAL_MS = 2_000L
         // Active-only eviction: networks that have not produced a fresh scan
         // result within 3s are stale and are purged from the live list, so an
         // offline/out-of-range access point can never linger as a "threat".
@@ -51,6 +56,7 @@ class WifiScanner(private val context: Context) {
     private val isScanning = AtomicBoolean(false)
 
     private val scanAttempts = AtomicInteger(0)
+    private var lastScanRequestedAt = 0L
 
     fun isWifiEnabled(): Boolean {
         return try {
@@ -98,18 +104,26 @@ class WifiScanner(private val context: Context) {
 
         scanJob = scope.launch {
             while (isActive && isScanning.get()) {
-                var interval = WIFI_SCAN_INTERVAL_MS
-                safeExecute("WiFi scan loop") {
-                    val started = wifiManager?.startScan() ?: false
-                    val attempt = scanAttempts.incrementAndGet()
-                    Log.d(TAG, "WiFi scan attempt #$attempt: ${if (started) "OK" else "THROTTLED"}")
+                safeExecute("WiFi poll loop") {
+                    val now = System.currentTimeMillis()
+                    // Request a fresh OS scan only on the throttle cadence;
+                    // the cached scanResults are still processed EVERY tick so
+                    // nameless hotspots appear the instant a scan lands.
+                    if (now - lastScanRequestedAt >= WIFI_SCAN_INTERVAL_MS) {
+                        lastScanRequestedAt = now
+                        val started = wifiManager?.startScan() ?: false
+                        scanAttempts.incrementAndGet()
+                        Log.d(
+                            TAG,
+                            "WiFi scan request #${scanAttempts.get()}: " +
+                                "${if (started) "OK" else "THROTTLED"}"
+                        )
+                    }
 
                     processScanResults()
                     cleanupStaleDevices()
-
-                    interval = if (started) WIFI_SCAN_INTERVAL_MS else 45_000L
                 }
-                delay(interval)
+                delay(WIFI_POLL_INTERVAL_MS)
             }
         }
 
@@ -163,10 +177,14 @@ class WifiScanner(private val context: Context) {
 
     private fun processSingleResult(result: WifiScanResult) {
         try {
-            val ssid = result.SSID?.trim()
-            val displaySsid = ssid?.ifEmpty { "Hidden Network" } ?: "Hidden Network"
-            val bssid = result.BSSID?.uppercase() ?: return
+            val bssid = result.BSSID?.trim()?.uppercase() ?: return
             if (bssid.isEmpty()) return
+
+            val ssid = result.SSID?.trim()
+            // Never discard an unnamed AP — surface it as a Mobile Hotspot
+            // candidate (BSSID-derived label) so it is detected instantly.
+            val displaySsid = ssid?.takeIf { it.isNotBlank() }
+                ?: "Mobile Hotspot (${bssid.takeLast(5)})"
 
             val rssi = result.level
             if (rssi == 0) return
@@ -256,7 +274,11 @@ class WifiScanner(private val context: Context) {
                             val bssid = result.BSSID
                             val rssi = result.level
                             if (bssid.isNotEmpty() && !discoveredNetworks.containsKey(bssid)) {
-                                val deviceName = if (ssid.isNotEmpty()) ssid else "Hidden Network"
+                                val deviceName = if (ssid.isNotBlank()) {
+                                    ssid
+                                } else {
+                                    "Mobile Hotspot (${bssid.takeLast(5)})"
+                                }
                                 val scanResult = ScanResult(
                                     macAddress = bssid,
                                     deviceName = deviceName,
@@ -341,7 +363,11 @@ class WifiScanner(private val context: Context) {
                     results.add(
                         ScanResult(
                             macAddress = bssid,
-                            deviceName = if (ssid.isNotEmpty()) ssid else "Hidden Network",
+                            deviceName = if (ssid.isNotBlank()) {
+                                ssid
+                            } else {
+                                "Mobile Hotspot (${bssid.takeLast(5)})"
+                            },
                             rssi = rssi,
                             isBluetooth = false,
                             isWifi = true,
